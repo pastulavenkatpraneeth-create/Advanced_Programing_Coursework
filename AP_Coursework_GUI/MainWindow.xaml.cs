@@ -29,6 +29,16 @@ namespace AP_Coursework_GUI
         private const double MinZoom = 0.1;
         private const double MaxZoom = 20.0;
 
+        // Live plotting state
+        private bool _livePlotEnabled = true;
+        private bool _hasLive = false;
+        private string _liveExpr = string.Empty;
+        private string[] _liveSetup = Array.Empty<string>();
+        private double _viewXmin = -10.0;
+        private double _viewXmax = 10.0;
+
+        private const double PlotPad = 50.0;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -83,16 +93,15 @@ namespace AP_Coursework_GUI
                                 var r = ExprEvaluator.GetPlotRange();
                                 ClearCanvas();
                                 DrawPlot(pts, r.Item1, r.Item2, mode);
-                                // consumed
-                                try { ExprEvaluator.ClearPlotData(); } catch { /* ignore */ }
+                                try { ExprEvaluator.ClearPlotData(); } catch {}
                             }
                             else
                             {
-                                try { ExprEvaluator.ClearPlotData(); } catch { /* ignore */ }
+                                try { ExprEvaluator.ClearPlotData(); } catch {}
                             }
                         }
                     }
-                    catch { /* ignore plotting errors here */ }
+                    catch {}
                 }
             }
             catch(Exception ex)
@@ -138,7 +147,7 @@ namespace AP_Coursework_GUI
                 return;
             }
             string expr = lines[lines.Length-1];
-            var setup = lines.Take(lines.Length-1);
+            var setup = lines.Take(lines.Length-1).ToArray();
 
             ExprEvaluator.ResetState();
             foreach (var stmt in setup)
@@ -162,7 +171,8 @@ namespace AP_Coursework_GUI
                     ErrorBox.Text = $"At x={x.ToString("0.###", CultureInfo.InvariantCulture)}: {yStr}";
                     return;
                 }
-                if (double.TryParse(yStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double y))
+                if (double.TryParse(yStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double y)
+                    && !double.IsNaN(y) && !double.IsInfinity(y))
                 {
                     points.Add(new Point(x, y));
                 }
@@ -177,6 +187,19 @@ namespace AP_Coursework_GUI
 
             // Draw on embedded canvas in MainWindow
             DrawPlot(points, xmin, xmax);
+            _liveExpr = expr;
+            _liveSetup = setup;
+            double r = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
+            if (r < 1e-9) r = 10.0;
+            _viewXmin = -r;
+            _viewXmax = r;
+            _hasLive = true;
+            _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+            _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+            if (_livePlotEnabled)
+            {
+                ReplotCurrentView();
+            }
         }
 
         private bool PrepareYDefinition(out string[] setupLines)
@@ -189,7 +212,7 @@ namespace AP_Coursework_GUI
                              .Where(s => s.Length>0)
                              .ToArray();
             if (lines.Length == 0) { ErrorBox.Text = "Nothing to evaluate."; return false; }
-            setupLines = lines; // evaluate all; last may be expr, harmless
+            setupLines = lines;
             ExprEvaluator.ResetState();
             foreach (var stmt in setupLines)
             {
@@ -365,27 +388,151 @@ namespace AP_Coursework_GUI
             PlotCanvas.UpdateLayout();
         }
 
+        // Re-sample and draw current live view
+        private void ReplotCurrentView()
+        {
+            if (PlotCanvas == null || !_hasLive) return;
+            
+            ExprEvaluator.ResetState();
+            foreach (var stmt in _liveSetup)
+            {
+                string res = ExprEvaluator.EvaluateExpression(stmt);
+                if (res.StartsWith("Lexer") || res.StartsWith("Parser") || res.StartsWith("Runtime") || res.StartsWith("Error"))
+                {
+                    ErrorBox.Text = $"Setup error: {res}";
+                    return;
+                }
+            }
+
+            // enforce symmetric x-range around 0 so (0,0) is centered
+            double r = Math.Max(Math.Abs(_viewXmin), Math.Abs(_viewXmax));
+            if (r < 1e-9) r = 10.0;
+            _viewXmin = -r;
+            _viewXmax = r;
+
+            double width = Math.Max(PlotCanvas.ActualWidth, 10);
+            int targetSamples = (int)Math.Clamp(Math.Round(width / 2.5), 200, 2000);
+            double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
+            double step = xrange / (targetSamples - 1);
+
+            var pts = new List<Point>(targetSamples);
+            double x = _viewXmin;
+            for (int i = 0; i < targetSamples; i++)
+            {
+                string yStr = ExprEvaluator.EvaluateExprForX(_liveExpr, x);
+                if (double.TryParse(yStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double y)
+                    && !double.IsNaN(y) && !double.IsInfinity(y))
+                {
+                    pts.Add(new Point(x, y));
+                }
+                x += step;
+            }
+            if (pts.Count >= 2)
+            {
+                DrawPlot(pts, _viewXmin, _viewXmax);
+            }
+        }
+
+        private void LivePlotCheck_Changed(object sender, RoutedEventArgs e)
+        {
+            _livePlotEnabled = LivePlotCheck?.IsChecked == true;
+            if (!PlotCanvas?.IsLoaded ?? true) return;
+
+            if (_livePlotEnabled)
+            {
+                // If live plot isn't initialized yet, attempt to initialize from current inputs
+                if (!_hasLive)
+                {
+                    string input = InputTextBox.Text.Trim();
+                    var lines = input.Split(new[] { '\n', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                                     .Select(s => s.Trim())
+                                     .Where(s => s.Length > 0)
+                                     .ToArray();
+                    if (lines.Length >= 1)
+                    {
+                        string expr = lines[lines.Length - 1];
+                        var setup = lines.Take(lines.Length - 1).ToArray();
+                        try
+                        {
+                            ExprEvaluator.ResetState();
+                            foreach (var stmt in setup)
+                            {
+                                string res = ExprEvaluator.EvaluateExpression(stmt);
+                                if (res.StartsWith("Lexer") || res.StartsWith("Parser") || res.StartsWith("Runtime") || res.StartsWith("Error"))
+                                {
+                                    ErrorBox.Text = $"Setup error: {res}";
+                                    return;
+                                }
+                            }
+                            _liveExpr = expr;
+                            _liveSetup = setup;
+                            _hasLive = true;
+                            if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _viewXmin)) _viewXmin = -10.0;
+                            if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _viewXmax)) _viewXmax = 10.0;
+                            if (_viewXmax <= _viewXmin) { _viewXmin = -10.0; _viewXmax = 10.0; }
+                        }
+                        catch { /* ignore */ }
+                    }
+                }
+                // Reset transform and replot if we have a live plot
+                if (_hasLive)
+                {
+                    _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+                    _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+                    ReplotCurrentView();
+                }
+            }
+        }
+
+        private void PlotCanvas_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (_hasLive)
+            {
+                ReplotCurrentView();
+            }
+        }
+
         // Mouse interaction handlers for panning and zooming on PlotCanvas
         private void PlotCanvas_MouseWheel(object sender, MouseWheelEventArgs e)
         {
             if (PlotCanvas == null) return;
-            // Zoom factor per wheel notch
-            double zoomDelta = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
-            double newScale = Math.Clamp(_scaleTransform.ScaleX * zoomDelta, MinZoom, MaxZoom);
-            zoomDelta = newScale / _scaleTransform.ScaleX;
 
-            // Zoom around mouse position (keep pointer fixed in content coordinates)
-            Point mousePos = e.GetPosition(PlotCanvas);
-            // Convert to content space before scaling
-            var inv = _plotTransform.Value;
-            // For order Scale then Translate, inverse mapping for alignment:
-            // We want to keep the point under cursor stable: newT = mouse - zoomDelta*(mouse - oldT)
-            _translateTransform.X = mousePos.X - zoomDelta * (mousePos.X - _translateTransform.X);
-            _translateTransform.Y = mousePos.Y - zoomDelta * (mousePos.Y - _translateTransform.Y);
+            // Live mode: zoom symmetrically around 0 so origin stays centered
+            if (_livePlotEnabled && _hasLive)
+            {
+                double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
+                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1; // wheel up -> zoom in
+                double newRange = xrange / zoom;
+                double r = Math.Max(newRange / 2.0, 1e-6);
+                _viewXmin = -r;
+                _viewXmax = r;
 
-            _scaleTransform.ScaleX = newScale;
-            _scaleTransform.ScaleY = newScale;
+                // Reset transform to avoid double transforms
+                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
 
+                ReplotCurrentView();
+                e.Handled = true;
+                return;
+            }
+
+            if (_hasLive)
+            {
+                double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
+                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
+                double newRange = xrange / zoom;
+                double r = Math.Max(newRange / 2.0, 1e-6);
+                _viewXmin = -r;
+                _viewXmax = r;
+                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+                ReplotCurrentView();
+                e.Handled = true;
+                return;
+            }
+
+            _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+            _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
             e.Handled = true;
         }
 
@@ -412,22 +559,50 @@ namespace AP_Coursework_GUI
             Point p = e.GetPosition(PlotCanvas);
             Vector delta = p - _lastPanPoint;
             _lastPanPoint = p;
-            _translateTransform.X += delta.X;
-            _translateTransform.Y += delta.Y;
+
+            if (_livePlotEnabled && _hasLive)
+            {
+                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+                ReplotCurrentView();
+            }
+            else
+            {
+                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+                if (_hasLive) ReplotCurrentView();
+            }
             e.Handled = true;
         }
 
         private void PlotCanvas_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
         {
-            // Reset view
-            _scaleTransform.ScaleX = 1.0;
-            _scaleTransform.ScaleY = 1.0;
-            _translateTransform.X = 0.0;
-            _translateTransform.Y = 0.0;
+            if (_livePlotEnabled && _hasLive)
+            {
+                // Reset world range to inputs or defaults
+                if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmin)) xmin = -10.0;
+                if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmax)) xmax = 10.0;
+                if (xmax <= xmin) { xmin = -10.0; xmax = 10.0; }
+                double r = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
+                if (r < 1e-9) r = 10.0;
+                _viewXmin = -r;
+                _viewXmax = r;
+                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
+                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+                ReplotCurrentView();
+            }
+            else
+            {
+                // Reset transform view
+                _scaleTransform.ScaleX = 1.0;
+                _scaleTransform.ScaleY = 1.0;
+                _translateTransform.X = 0.0;
+                _translateTransform.Y = 0.0;
+            }
             e.Handled = true;
         }
 
-        // Embedded plotting (ported from PlotWindow)
+        // Embedded plotting
         private void DrawPlot(List<Point> data, double xmin, double xmax)
         {
             DrawPlot(data, xmin, xmax, "linear");
@@ -443,29 +618,22 @@ namespace AP_Coursework_GUI
             double height = Math.Max(PlotCanvas.ActualHeight, 10);
             if (width < 50) width = 800;
             if (height < 50) height = 500;
-            double pad = 50;
+            double pad = PlotPad;
 
-            double ymin = data.Min(p => p.Y);
-            double ymax = data.Max(p => p.Y);
-            if (Math.Abs(ymax - ymin) < 1e-9) { ymax = ymin + 1; }
+            // Symmetric ranges around 0
+            double xAbsMax = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
+            if (xAbsMax < 1e-9) xAbsMax = 10.0;
+            double sxmin = -xAbsMax;
+            double sxmax = xAbsMax;
 
-            Func<double, double> xToPx = xv => pad + (xv - xmin) / (xmax - xmin) * (width - 2 * pad);
+            double yAbsMax = Math.Max(Math.Abs(data.Min(p => p.Y)), Math.Abs(data.Max(p => p.Y)));
+            if (yAbsMax < 1e-6) yAbsMax = 1.0;
+            double ymin = -yAbsMax;
+            double ymax = yAbsMax;
+
+            Func<double, double> xToPx = xv => pad + (xv - sxmin) / (sxmax - sxmin) * (width - 2 * pad);
             Func<double, double> yToPy = yv => height - pad - (yv - ymin) / (ymax - ymin) * (height - 2 * pad);
-
-            // Axes
-            if (xmin <= 0 && 0 <= xmax)
-            {
-                var x0 = xToPx(0);
-                var vline = new Line { X1 = x0, X2 = x0, Y1 = pad, Y2 = height - pad, Stroke = Brushes.LightGray, StrokeThickness = 1.5 };
-                PlotCanvas.Children.Add(vline);
-            }
-            if (ymin <= 0 && 0 <= ymax)
-            {
-                var y0 = yToPy(0);
-                var hline = new Line { X1 = pad, X2 = width - pad, Y1 = y0, Y2 = y0, Stroke = Brushes.LightGray, StrokeThickness = 1.5 };
-                PlotCanvas.Children.Add(hline);
-            }
-
+            
             double NiceStep(double range, int targetTicks = 8)
             {
                 if (range <= 0 || double.IsNaN(range) || double.IsInfinity(range)) return 1.0;
@@ -484,15 +652,52 @@ namespace AP_Coursework_GUI
                 return v.ToString("0.###", CultureInfo.InvariantCulture);
             }
 
-            // X ticks
+            // Grid lines (vertical)
             {
-                double xrange = xmax - xmin;
+                double xrange = sxmax - sxmin;
                 double step = NiceStep(xrange);
-                double start = Math.Ceiling(xmin / step) * step;
+                double start = Math.Ceiling(sxmin / step) * step;
+                int guard = 0;
+                for (double xv = start; xv <= sxmax + 1e-12 && guard < 20000; xv += step, guard++)
+                {
+                    double px = xToPx(xv);
+                    var grid = new Line { X1 = px, X2 = px, Y1 = pad, Y2 = height - pad, Stroke = Brushes.Gainsboro, StrokeThickness = 1 };
+                    PlotCanvas.Children.Add(grid);
+                }
+            }
+
+            // Grid lines (horizontal)
+            {
+                double yrange = ymax - ymin;
+                double step = NiceStep(yrange);
+                double start = Math.Ceiling(ymin / step) * step;
+                int guard = 0;
+                for (double yv = start; yv <= ymax + 1e-12 && guard < 20000; yv += step, guard++)
+                {
+                    double py = yToPy(yv);
+                    var grid = new Line { X1 = pad, X2 = width - pad, Y1 = py, Y2 = py, Stroke = Brushes.Gainsboro, StrokeThickness = 1 };
+                    PlotCanvas.Children.Add(grid);
+                }
+            }
+
+            // Axes through center (0,0)
+            {
+                var x0 = xToPx(0);
+                var vline = new Line { X1 = x0, X2 = x0, Y1 = pad, Y2 = height - pad, Stroke = Brushes.Black, StrokeThickness = 1.5 };
+                PlotCanvas.Children.Add(vline);
+                var y0 = yToPy(0);
+                var hline = new Line { X1 = pad, X2 = width - pad, Y1 = y0, Y2 = y0, Stroke = Brushes.Black, StrokeThickness = 1.5 };
+                PlotCanvas.Children.Add(hline);
+            }
+            
+            {
+                double xrange = sxmax - sxmin;
+                double step = NiceStep(xrange);
+                double start = Math.Ceiling(sxmin / step) * step;
                 double yBase = height - pad;
                 double tickLen = 8;
                 int guard = 0;
-                for (double xv = start; xv <= xmax + 1e-12 && guard < 10000; xv += step, guard++)
+                for (double xv = start; xv <= sxmax + 1e-12 && guard < 10000; xv += step, guard++)
                 {
                     double px = xToPx(xv);
                     var t = new Line { X1 = px, X2 = px, Y1 = yBase, Y2 = yBase - tickLen, Stroke = Brushes.Gray, StrokeThickness = 1 };
@@ -505,8 +710,7 @@ namespace AP_Coursework_GUI
                     Canvas.SetTop(tb, yBase + 4);
                 }
             }
-
-            // Y ticks
+            
             {
                 double yrange = ymax - ymin;
                 double step = NiceStep(yrange);
@@ -527,6 +731,17 @@ namespace AP_Coursework_GUI
                     Canvas.SetTop(tb, py - tb.DesiredSize.Height / 2);
                 }
             }
+
+            // Axes labels
+            var xLabel = new TextBlock { Text = "X", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.Black };
+            PlotCanvas.Children.Add(xLabel);
+            Canvas.SetLeft(xLabel, xToPx(sxmax) + 10);
+            Canvas.SetTop(xLabel, yToPy(0) + 8);
+
+            var yLabel = new TextBlock { Text = "Y", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.Black };
+            PlotCanvas.Children.Add(yLabel);
+            Canvas.SetLeft(yLabel, xToPx(0) - 14);
+            Canvas.SetTop(yLabel, yToPy(ymax) - 20);
 
             // Plot line
             if (string.Equals(mode, "spline", StringComparison.OrdinalIgnoreCase) && data.Count >= 4)
@@ -566,16 +781,6 @@ namespace AP_Coursework_GUI
                 PlotCanvas.Children.Add(poly);
             }
 
-            // Axis labels
-            var xLabel = new TextBlock { Text = "X", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.Black };
-            PlotCanvas.Children.Add(xLabel);
-            Canvas.SetLeft(xLabel, width - pad + 20);
-            Canvas.SetTop(xLabel, height - pad - 10);
-
-            var yLabel = new TextBlock { Text = "Y", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.Black };
-            PlotCanvas.Children.Add(yLabel);
-            Canvas.SetLeft(yLabel, pad - 20);
-            Canvas.SetTop(yLabel, pad - 30);
         }
 
     }

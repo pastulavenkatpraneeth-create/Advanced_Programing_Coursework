@@ -40,6 +40,8 @@
 
                     <Button Content="Plot" Width="90" Click="Plot_Click"/>
 
+                    <CheckBox Name="LivePlotCheck" Content="Live Plot" IsChecked="True" Margin="8,0,0,0" VerticalAlignment="Center" Checked="LivePlotCheck_Changed" Unchecked="LivePlotCheck_Changed" ToolTip="Continuously re-sample while panning/zooming"/>
+
                     <TextBlock Text="x0:" VerticalAlignment="Center" Margin="10,0,4,0"/>
                     <TextBox Name="X0Box" Width="70" ToolTip="Point x0 for derivative and tangent"/>
                     <Button Content="Plot y'(x)" Width="110" Click="PlotDerivative_Click"/>
@@ -81,7 +83,8 @@
                             MouseLeftButtonDown="PlotCanvas_MouseLeftButtonDown"
                             MouseLeftButtonUp="PlotCanvas_MouseLeftButtonUp"
                             MouseMove="PlotCanvas_MouseMove"
-                            MouseRightButtonDown="PlotCanvas_MouseRightButtonDown"/>
+                            MouseRightButtonDown="PlotCanvas_MouseRightButtonDown"
+                            SizeChanged="PlotCanvas_SizeChanged"/>
                 </Border>
             </Grid>
         </Border>
