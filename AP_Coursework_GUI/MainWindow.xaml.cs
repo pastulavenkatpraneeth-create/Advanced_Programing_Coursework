@@ -20,9 +20,31 @@ namespace AP_Coursework_GUI
     public partial class MainWindow : Window
     {
 
+        // Pan/Zoom state
+        private bool _isPanning = false;
+        private Point _lastPanPoint;
+        private ScaleTransform _scaleTransform = new ScaleTransform(1.0, 1.0);
+        private TranslateTransform _translateTransform = new TranslateTransform(0.0, 0.0);
+        private TransformGroup _plotTransform;
+        private const double MinZoom = 0.1;
+        private const double MaxZoom = 20.0;
+
         public MainWindow()
         {
             InitializeComponent();
+            // Initialize transform group for interactive pan/zoom
+            _plotTransform = new TransformGroup();
+            _plotTransform.Children.Add(_scaleTransform); // scale first
+            _plotTransform.Children.Add(_translateTransform); // then translate
+            // PlotCanvas may be null during design-time
+            this.Loaded += (s, e) =>
+            {
+                if (PlotCanvas != null)
+                {
+                    PlotCanvas.RenderTransform = _plotTransform;
+                    PlotCanvas.SnapsToDevicePixels = true;
+                }
+            };
         }
 
         private void Evaluate_Click(object sender, RoutedEventArgs e)
@@ -335,7 +357,74 @@ namespace AP_Coursework_GUI
         {
             if (PlotCanvas == null) return;
             PlotCanvas.Children.Clear();
+            // Keep existing pan/zoom transform intact
+            if (PlotCanvas.RenderTransform == null)
+            {
+                PlotCanvas.RenderTransform = _plotTransform;
+            }
             PlotCanvas.UpdateLayout();
+        }
+
+        // Mouse interaction handlers for panning and zooming on PlotCanvas
+        private void PlotCanvas_MouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (PlotCanvas == null) return;
+            // Zoom factor per wheel notch
+            double zoomDelta = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
+            double newScale = Math.Clamp(_scaleTransform.ScaleX * zoomDelta, MinZoom, MaxZoom);
+            zoomDelta = newScale / _scaleTransform.ScaleX;
+
+            // Zoom around mouse position (keep pointer fixed in content coordinates)
+            Point mousePos = e.GetPosition(PlotCanvas);
+            // Convert to content space before scaling
+            var inv = _plotTransform.Value;
+            // For order Scale then Translate, inverse mapping for alignment:
+            // We want to keep the point under cursor stable: newT = mouse - zoomDelta*(mouse - oldT)
+            _translateTransform.X = mousePos.X - zoomDelta * (mousePos.X - _translateTransform.X);
+            _translateTransform.Y = mousePos.Y - zoomDelta * (mousePos.Y - _translateTransform.Y);
+
+            _scaleTransform.ScaleX = newScale;
+            _scaleTransform.ScaleY = newScale;
+
+            e.Handled = true;
+        }
+
+        private void PlotCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (PlotCanvas == null) return;
+            _isPanning = true;
+            _lastPanPoint = e.GetPosition(PlotCanvas);
+            PlotCanvas.CaptureMouse();
+            e.Handled = true;
+        }
+
+        private void PlotCanvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (PlotCanvas == null) return;
+            _isPanning = false;
+            PlotCanvas.ReleaseMouseCapture();
+            e.Handled = true;
+        }
+
+        private void PlotCanvas_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (!_isPanning || PlotCanvas == null) return;
+            Point p = e.GetPosition(PlotCanvas);
+            Vector delta = p - _lastPanPoint;
+            _lastPanPoint = p;
+            _translateTransform.X += delta.X;
+            _translateTransform.Y += delta.Y;
+            e.Handled = true;
+        }
+
+        private void PlotCanvas_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            // Reset view
+            _scaleTransform.ScaleX = 1.0;
+            _scaleTransform.ScaleY = 1.0;
+            _translateTransform.X = 0.0;
+            _translateTransform.Y = 0.0;
+            e.Handled = true;
         }
 
         // Embedded plotting (ported from PlotWindow)

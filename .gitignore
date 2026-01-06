@@ -1,0 +1,97 @@
+# .gitignore
+
+[Bb]in/
+[Oo]bj/
+[Bb]uild/
+[Bb]ld/
+[Ll]og/
+[Ll]ogs/
+[Tt]est[Rr]esults/
+[Rr]elease*/
+[Dd]ebug*/
+[xX]64/
+[xX]86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+
+# MSBuild & restore artifacts
+project.lock.json
+project.fragment.lock.json
+artifacts/
+*.nuget.props
+*.nuget.targets
+
+# NuGet
+packages/
+*.nupkg
+*.snupkg
+.nuget/packages/*
+
+# Symbols and intermediate
+*.pdb
+*.mdb
+*.obj
+*.idb
+*.ilk
+*.ipch
+*.iobj
+*.ipdb
+*.pch
+*.cache
+*.tmp
+*.tlog
+
+# Logs and traces
+*.log
+*.svclog
+*.trace
+*.etl
+msbuild.log
+msbuild.binlog
+
+# IDE and tooling
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.ide/
+
+# JetBrains Rider / ReSharper
+.idea/
+.ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+*.sln.DotSettings.user
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# NCrunch
+*.ncrunch*
+_NCrunch_*/
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Misc editors
+*~
+*.swp
+*.swo
+
+# WPF/XAML
+*/*.g.cs
+*/*.g.i.cs
+*/*Resources.Designer.cs
+*.generated.cs
+
+*.md
