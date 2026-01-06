@@ -1,5 +1,6 @@
 ﻿module ExprEvaluator
 open System
+open System.Globalization
 
 // Tokens
 type Token =
@@ -518,6 +519,105 @@ let parseAndEval tokens =
   if rest <> [] then raise (ParseError "Extra tokens after expression")
   value, isFloat
 
+let rec transpileE tokens : Token list * string =
+  let (t2, s1) = transpileT tokens
+  transpileEopt t2 s1
+and transpileEopt tokens acc =
+  match tokens with
+  | Plus :: tail -> let (t2, s2) = transpileT tail in transpileEopt t2 ("(" + acc + "+" + s2 + ")")
+  | Minus :: tail -> let (t2, s2) = transpileT tail in transpileEopt t2 ("(" + acc + "-" + s2 + ")")
+  | _ -> tokens, acc
+and transpileT tokens =
+  let (t2, s1) = transpileF tokens
+  transpileTopt t2 s1
+and transpileTopt tokens acc =
+  match tokens with
+  | Mul :: tail -> let (t2, s2) = transpileF tail in transpileTopt t2 ("(" + acc + "*" + s2 + ")")
+  | Div :: tail -> let (t2, s2) = transpileF tail in transpileTopt t2 ("(" + acc + "/" + s2 + ")")
+  | Mod :: tail -> let (t2, s2) = transpileF tail in transpileTopt t2 ("(" + acc + "%" + s2 + ")")
+  | _ -> tokens, acc
+and transpileF tokens =
+  let (t2, s1) = transpileU tokens
+  match t2 with
+  | Pow :: tail ->
+      let (t3, s2) = transpileF tail
+      t3, ("Math.Pow(" + s1 + ", " + s2 + ")")
+  | _ -> t2, s1
+and transpileU tokens =
+  match tokens with
+  | Minus :: tail -> let (ts2, s) = transpileU tail in ts2, ("(-" + s + ")")
+  | Plus :: tail -> transpileU tail
+  | _ -> transpileP tokens
+and transpileP tokens =
+  match tokens with
+  | Number (n, _) :: tail -> tail, n.ToString(CultureInfo.InvariantCulture)
+  | Ident name :: Lpar :: rest ->
+      // function call
+      let rec parseArgs ts acc =
+        let (tNext, sArg) = transpileE ts
+        match tNext with
+        | Comma :: more -> parseArgs more (acc @ [sArg])
+        | Rpar :: more -> more, (acc @ [sArg])
+        | _ -> raise (ParseError "Expected ',' or ')' in argument list")
+      let (afterCall, args) = parseArgs rest []
+      // Map known built-ins to Math
+      let targetName =
+        match name.ToLowerInvariant() with
+        | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sqrt" | "log" | "log10" | "exp" | "abs" ->
+            let cap = name.Substring(0,1).ToUpper() + name.Substring(1).ToLower()
+            "Math." + cap
+        | _ -> name
+      afterCall, (targetName + "(" + String.Join(",", args) + ")")
+  | Ident name :: tail -> tail, name
+  | Lpar :: tail ->
+      let (t2, s) = transpileE tail
+      match t2 with
+      | Rpar :: more -> more, ("(" + s + ")")
+      | _ -> raise (ParseError "Missing ')'")
+  | _ -> raise (ParseError "Unexpected token while transpiling")
+
+let TranspileToCSharp (input: string) =
+  try
+    let lines = 
+      input.Split([|'\n'; ';'|], StringSplitOptions.RemoveEmptyEntries)
+      |> Array.map (fun s -> s.Trim())
+      |> Array.filter (fun s -> s <> "")
+    let mutable funcs : (string * string * string) list = [] // name, param, bodyCs
+    let mutable yDef : (string * string) option = None
+    for line in lines do
+      let toks = lexer line
+      match toks with
+      | Ident fname :: Lpar :: Ident param :: Rpar :: Assign :: rest ->
+          let (after, bodyCs) = transpileE rest
+          if after <> [] then raise (ParseError "Extra tokens after function body")
+          if fname = "y" then yDef <- Some (param, bodyCs)
+          else funcs <- (fname, param, bodyCs) :: funcs
+      | _ -> ()
+    match yDef with
+    | None -> raise (ParseError "Missing y(x)=... definition for entry point")
+    | Some (yParam, yBody) ->
+        let sb = System.Text.StringBuilder()
+        let append (s:string) = sb.AppendLine(s) |> ignore
+        append "using System;"
+        append "using System.Globalization;"
+        append "public static class Program {"
+        for (n,p,b) in List.rev funcs do
+          append $"  public static double {n}(double {p}) => {b};"
+        append $"  public static double y(double {yParam}) => {yBody};"
+        append "  public static int Main(string[] args) {"
+        append "    double x = 0.0;"
+        append "    if (args.Length > 0) double.TryParse(args[0], NumberStyles.Float, CultureInfo.InvariantCulture, out x);"
+        append "    double v = y(x);"
+        append "    Console.WriteLine(v.ToString(CultureInfo.InvariantCulture));"
+        append "    return 0;"
+        append "  }"
+        append "}"
+        sb.ToString()
+  with
+  | LexError msg -> $"Lexer error: {msg}"
+  | ParseError msg -> $"Parser error: {msg}"
+  | ex -> $"Error: {ex.Message}"
+
 let EvaluateExpression (input: string) =
     try
         if obj.ReferenceEquals(symbolTable, null) then
@@ -563,6 +663,25 @@ let GetPlotData () = plotPoints |> List.rev |> List.toArray
 let GetPlotMode () = match plotMode with | Some m -> m | None -> "linear"
 let GetPlotRange () = match plotRange with | Some (a,b) -> (a,b) | None -> (0.0,1.0)
 let ClearPlotData () = plotPoints <- []; plotMode <- None; plotRange <- None
+
+let ValidateInterpreter (input: string) =
+    try
+        // Use lexer and a dry run of parse to validate; accumulate definitions without executing heavy ops
+        let lines =
+            input.Split([|'\n'; ';'|], StringSplitOptions.RemoveEmptyEntries)
+            |> Array.map (fun s -> s.Trim())
+            |> Array.filter (fun s -> s <> "")
+        for line in lines do
+            let tokens = lexer line
+            // Parse but ignore result to surface syntax errors
+            let (_v, _f) = parseAndEval tokens
+            ()
+        "OK"
+    with
+    | LexError msg -> "Lexer error: " + msg
+    | ParseError msg -> "Parser error: " + msg
+    | EvalError msg -> "Runtime error: " + msg
+    | ex -> "Error: " + ex.Message
 
 let EvaluateExprForX (expr: string) (x: float) =
     try

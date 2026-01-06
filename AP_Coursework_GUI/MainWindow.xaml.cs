@@ -39,6 +39,10 @@ namespace AP_Coursework_GUI
 
         private const double PlotPad = 50.0;
 
+        // Transpiler/Compiler state
+        private string _lastProjectDir = string.Empty;
+        private string _lastExecutablePath = string.Empty;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -55,6 +59,174 @@ namespace AP_Coursework_GUI
                     PlotCanvas.SnapsToDevicePixels = true;
                 }
             };
+        }
+
+        private void CheckInterpreter_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var src = InputTextBox.Text ?? string.Empty;
+                var ok = ExprEvaluator.ValidateInterpreter(src);
+                if (ok == "OK")
+                {
+                    ErrorBox.Text = "Interpreter: OK";
+                }
+                else
+                {
+                    ErrorBox.Text = ok;
+                }
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = "Check failed: " + ex.Message;
+            }
+        }
+
+        private void Transpile_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var src = InputTextBox.Text ?? string.Empty;
+                var cs = ExprEvaluator.TranspileToCSharp(src);
+                TargetCodeBox.Text = cs;
+                if (cs.StartsWith("Lexer") || cs.StartsWith("Parser") || cs.StartsWith("Error"))
+                {
+                    ErrorBox.Text = cs;
+                }
+                else
+                {
+                    ErrorBox.Text = "Transpile: OK";
+                }
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = "Transpile failed: " + ex.Message;
+            }
+        }
+
+        private void CheckTarget_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var code = TargetCodeBox.Text ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(code))
+                {
+                    ErrorBox.Text = "Target code is empty. Transpile first.";
+                    return;
+                }
+                var projDir = WriteCSharpProject(code);
+                _lastProjectDir = projDir;
+                var (ok, buildOut, exePath) = CompileProject(projDir);
+                _lastExecutablePath = exePath;
+                if (ok)
+                {
+                    ErrorBox.Text = "Target compile check: OK";
+                }
+                else
+                {
+                    ErrorBox.Text = buildOut;
+                }
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = "Check target failed: " + ex.Message;
+            }
+        }
+
+        private void Compile_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var code = TargetCodeBox.Text ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(code))
+                {
+                    ErrorBox.Text = "Target code is empty. Transpile first.";
+                    return;
+                }
+                var projDir = WriteCSharpProject(code);
+                _lastProjectDir = projDir;
+                var (ok, buildOut, exePath) = CompileProject(projDir);
+                _lastExecutablePath = exePath;
+                ErrorBox.Text = ok ? "Compile: OK\n" + buildOut : buildOut;
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = "Compile failed: " + ex.Message;
+            }
+        }
+
+        private void RunExecutable_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_lastExecutablePath) || !System.IO.File.Exists(_lastExecutablePath))
+                {
+                    ErrorBox.Text = "No executable found. Compile first.";
+                    return;
+                }
+                var (code, stdout, stderr) = RunProcess(_lastExecutablePath, "");
+                ResultTextBox.Text = stdout.Trim();
+                if (!string.IsNullOrWhiteSpace(stderr))
+                    ErrorBox.Text = stderr;
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = "Run failed: " + ex.Message;
+            }
+        }
+
+        private string WriteCSharpProject(string programCs)
+        {
+            string root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "MathTranspile");
+            System.IO.Directory.CreateDirectory(root);
+            string dir = System.IO.Path.Combine(root, Guid.NewGuid().ToString("N"));
+            System.IO.Directory.CreateDirectory(dir);
+            string csproj = System.IO.Path.Combine(dir, "Transpiled.csproj");
+            string prog = System.IO.Path.Combine(dir, "Program.cs");
+            System.IO.File.WriteAllText(prog, programCs);
+            string csprojText = "" +
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n" +
+                "  <PropertyGroup>\n" +
+                "    <OutputType>Exe</OutputType>\n" +
+                "    <TargetFramework>net8.0</TargetFramework>\n" +
+                "    <ImplicitUsings>enable</ImplicitUsings>\n" +
+                "    <Nullable>enable</Nullable>\n" +
+                "  </PropertyGroup>\n" +
+                "</Project>\n";
+            System.IO.File.WriteAllText(csproj, csprojText);
+            return dir;
+        }
+
+        private (bool ok, string output, string exePath) CompileProject(string projectDir)
+        {
+            var (code, stdout, stderr) = RunProcess("dotnet", "build \"" + projectDir + "\" -c Debug");
+            string output = stdout + (string.IsNullOrWhiteSpace(stderr) ? string.Empty : ("\n" + stderr));
+            bool success = code == 0;
+            string exePath = System.IO.Path.Combine(projectDir, "bin", "Debug", "net8.0", "Transpiled" + (Environment.OSVersion.Platform == PlatformID.Win32NT ? ".exe" : ""));
+            return (success, output, exePath);
+        }
+
+        private (int exitCode, string stdout, string stderr) RunProcess(string fileName, string args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            var p = new System.Diagnostics.Process { StartInfo = psi };
+            var sbOut = new StringBuilder();
+            var sbErr = new StringBuilder();
+            p.OutputDataReceived += (s, e) => { if (e.Data != null) sbOut.AppendLine(e.Data); };
+            p.ErrorDataReceived += (s, e) => { if (e.Data != null) sbErr.AppendLine(e.Data); };
+            p.Start();
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+            p.WaitForExit();
+            return (p.ExitCode, sbOut.ToString(), sbErr.ToString());
         }
 
         private void Evaluate_Click(object sender, RoutedEventArgs e)

@@ -24,11 +24,20 @@
                 <DropShadowEffect Color="#33000000" BlurRadius="10" ShadowDepth="2"/>
             </Border.Effect>
             <StackPanel Orientation="Vertical" VerticalAlignment="Top" >
-                <TextBlock Text="Enter expression or definitions (last line is y(x)):"  FontWeight="Bold" Margin="0,0,0,6"/>
-                <TextBox Name="InputTextBox" Height="90" FontSize="14" AcceptsReturn="True" TextWrapping="Wrap" ToolTip="Example: y(x)=sin(x) or definitions followed by y(x) on the last line"/>
+                <TextBlock Text="Source (Interpreter): definitions and y(x) on last line"  FontWeight="Bold" Margin="0,0,0,6"/>
+                <TextBox Name="InputTextBox" Height="120" FontSize="14" AcceptsReturn="True" TextWrapping="Wrap" ToolTip="Example: y(x)=sin(x) or definitions followed by y(x) on the last line"/>
                 <WrapPanel Margin="0,10,0,0" VerticalAlignment="Center" ItemHeight="32" ItemWidth="Auto">
                     <Button Content="Evaluate" Width="110" Click="Evaluate_Click"/>
+                    <Button Content="Check Interpreter" Width="140" Click="CheckInterpreter_Click"/>
+                    <Button Content="Transpile" Width="110" Click="Transpile_Click"/>
+                    <Button Content="Check Target" Width="120" Click="CheckTarget_Click"/>
+                    <Button Content="Compile" Width="100" Click="Compile_Click"/>
+                    <Button Content="Run" Width="90" Click="RunExecutable_Click"/>
+                </WrapPanel>
+                <TextBlock Text="Target (C# transpiled)"  FontWeight="Bold" Margin="0,10,0,6"/>
+                <TextBox Name="TargetCodeBox" Height="140" FontSize="13" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="False" ToolTip="Generated C# code will appear here. You can also edit before compiling."/>
 
+                <WrapPanel Margin="0,10,0,0" VerticalAlignment="Center" ItemHeight="32" ItemWidth="Auto">
                     <TextBlock Text="Xmin:" VerticalAlignment="Center" Margin="0,0,4,0"/>
                     <TextBox Name="XMinBox" Width="80" Text="-10" ToolTip="Minimum x for plotting"/>
 
