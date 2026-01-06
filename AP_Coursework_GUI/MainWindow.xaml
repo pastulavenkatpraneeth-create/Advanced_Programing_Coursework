@@ -63,6 +63,27 @@
 
                 <TextBlock Text="Errors" FontWeight="Bold" Margin="0,12,0,4"/>
                 <TextBox Name="ErrorBox" Height="60" FontSize="13" IsReadOnly="True" TextWrapping="Wrap"/>
+
+                <TextBlock Text="Compiler (INT5/GUI4)" FontWeight="Bold" Margin="0,16,0,6"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" Margin="0,0,6,0">
+                        <TextBlock Text="Interpreter Source" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                        <TextBox Name="SourceCodeBox" Height="140" AcceptsReturn="True" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Margin="6,0,0,0">
+                        <TextBlock Text="Target C# Code" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                        <TextBox Name="TargetCodeBox" Height="140" AcceptsReturn="True" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Grid>
+                <WrapPanel Margin="0,8,0,0">
+                    <Button Content="Transpile" Width="110" Click="Transpile_Click"/>
+                    <Button Content="Compile" Width="110" Margin="8,0,0,0" Click="Compile_Click"/>
+                    <Button Content="Run" Width="90" Margin="8,0,0,0" Click="Run_Click"/>
+                </WrapPanel>
             </StackPanel>
         </Border>
 

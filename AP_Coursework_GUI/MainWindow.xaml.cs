@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Windows;
@@ -38,6 +40,7 @@ namespace AP_Coursework_GUI
         private double _viewXmax = 10.0;
 
         private const double PlotPad = 50.0;
+        private string _lastCompiledPath = string.Empty;
 
         public MainWindow()
         {
@@ -305,7 +308,6 @@ namespace AP_Coursework_GUI
         private void Integrate_Click(object sender, RoutedEventArgs e)
         {
             ErrorBox.Clear(); ResultTextBox.Clear();
-            ClearCanvas(); // integration is scalar-only: clear any previous plot
             if (!double.TryParse(ABox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double a) ||
                 !double.TryParse(BBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double b))
             { ErrorBox.Text = "Enter a and b"; return; }
@@ -316,6 +318,29 @@ namespace AP_Coursework_GUI
             string res = ExprEvaluator.EvaluateExpression($"integrate({a.ToString(CultureInfo.InvariantCulture)}, {b.ToString(CultureInfo.InvariantCulture)}, {n})");
             if (res.StartsWith("Lexer") || res.StartsWith("Parser") || res.StartsWith("Runtime") || res.StartsWith("Error"))
             { ErrorBox.Text = res; return; }
+            // Visualize area under curve between [a,b]
+            double xmin = Math.Min(a, b);
+            double xmax = Math.Max(a, b);
+            var points = new List<Point>();
+            double x = xmin;
+            int guard = 0;
+            while (x <= xmax + 1e-12 && guard < 200000)
+            {
+                string yStr = ExprEvaluator.EvaluateExprForX("y(x)", x);
+                if (yStr.StartsWith("Lexer") || yStr.StartsWith("Parser") || yStr.StartsWith("Runtime") || yStr.StartsWith("Error"))
+                { ErrorBox.Text = $"At x={x.ToString("0.###", CultureInfo.InvariantCulture)}: {yStr}"; return; }
+                if (double.TryParse(yStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double y)
+                    && !double.IsNaN(y) && !double.IsInfinity(y))
+                {
+                    points.Add(new Point(x, y));
+                }
+                x += step;
+                guard++;
+            }
+            if (points.Count >= 2)
+            {
+                DrawPlot(points, xmin, xmax, "linear", points);
+            }
             ResultTextBox.Text = $"∫ y(x) dx ≈ {res}";
         }
 
@@ -373,6 +398,121 @@ namespace AP_Coursework_GUI
                 
             MessageBox.Show(helpText, "Help - Syntax and Tokens",
                 MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        private void Transpile_Click(object sender, RoutedEventArgs e)
+        {
+            ErrorBox.Clear();
+            string source = SourceCodeBox.Text.Trim();
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                source = InputTextBox.Text.Trim();
+            }
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                ErrorBox.Text = "Enter source code to transpile.";
+                return;
+            }
+            try
+            {
+                string target = ExprEvaluator.TranspileToCSharp(source);
+                TargetCodeBox.Text = target;
+                ResultTextBox.Text = "Transpilation complete.";
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = ex.Message;
+            }
+        }
+
+        private void Compile_Click(object sender, RoutedEventArgs e)
+        {
+            ErrorBox.Clear();
+            string target = TargetCodeBox.Text.Trim();
+            if (string.IsNullOrWhiteSpace(target))
+            {
+                ErrorBox.Text = "No target code to compile.";
+                return;
+            }
+
+            string tempDir = Path.Combine(Path.GetTempPath(), "APCourseworkCompiler");
+            Directory.CreateDirectory(tempDir);
+            string srcPath = Path.Combine(tempDir, $"Program_{DateTime.Now:yyyyMMdd_HHmmss}.cs");
+            string exePath = Path.ChangeExtension(srcPath, ".exe");
+            File.WriteAllText(srcPath, target);
+
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "csc",
+                    Arguments = $"/nologo /t:exe /out:\"{exePath}\" \"{srcPath}\"",
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = Process.Start(psi);
+                if (proc == null)
+                {
+                    ErrorBox.Text = "Failed to start C# compiler (csc).";
+                    return;
+                }
+                string stdout = proc.StandardOutput.ReadToEnd();
+                string stderr = proc.StandardError.ReadToEnd();
+                proc.WaitForExit();
+                if (proc.ExitCode != 0)
+                {
+                    ErrorBox.Text = $"Compile error:\n{stderr}\n{stdout}";
+                    return;
+                }
+                _lastCompiledPath = exePath;
+                ResultTextBox.Text = "Compilation succeeded.";
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = $"Compile failed: {ex.Message}";
+            }
+        }
+
+        private void Run_Click(object sender, RoutedEventArgs e)
+        {
+            ErrorBox.Clear();
+            if (string.IsNullOrWhiteSpace(_lastCompiledPath) || !File.Exists(_lastCompiledPath))
+            {
+                ErrorBox.Text = "No compiled executable available. Compile first.";
+                return;
+            }
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = _lastCompiledPath,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = Process.Start(psi);
+                if (proc == null)
+                {
+                    ErrorBox.Text = "Failed to start compiled executable.";
+                    return;
+                }
+                string stdout = proc.StandardOutput.ReadToEnd();
+                string stderr = proc.StandardError.ReadToEnd();
+                proc.WaitForExit();
+                if (!string.IsNullOrWhiteSpace(stderr))
+                {
+                    ErrorBox.Text = $"Runtime error:\n{stderr}";
+                    return;
+                }
+                ResultTextBox.Text = string.IsNullOrWhiteSpace(stdout) ? "Program ran with no output." : stdout.Trim();
+            }
+            catch (Exception ex)
+            {
+                ErrorBox.Text = $"Run failed: {ex.Message}";
+            }
         }
 
         // Canvas helpers
@@ -610,6 +750,11 @@ namespace AP_Coursework_GUI
 
         private void DrawPlot(List<Point> data, double xmin, double xmax, string mode)
         {
+            DrawPlot(data, xmin, xmax, mode, null);
+        }
+
+        private void DrawPlot(List<Point> data, double xmin, double xmax, string mode, List<Point> areaPoints)
+        {
             if (PlotCanvas == null) return;
             PlotCanvas.Children.Clear();
             PlotCanvas.UpdateLayout();
@@ -742,6 +887,24 @@ namespace AP_Coursework_GUI
             PlotCanvas.Children.Add(yLabel);
             Canvas.SetLeft(yLabel, xToPx(0) - 14);
             Canvas.SetTop(yLabel, yToPy(ymax) - 20);
+
+            // Area fill (optional)
+            if (areaPoints != null && areaPoints.Count >= 2)
+            {
+                var ordered = areaPoints.OrderBy(p => p.X).ToList();
+                var poly = new Polygon
+                {
+                    Fill = new SolidColorBrush(Color.FromArgb(80, 30, 136, 229)),
+                    Stroke = Brushes.Transparent
+                };
+                poly.Points.Add(new System.Windows.Point(xToPx(ordered.First().X), yToPy(0)));
+                foreach (var p in ordered)
+                {
+                    poly.Points.Add(new System.Windows.Point(xToPx(p.X), yToPy(p.Y)));
+                }
+                poly.Points.Add(new System.Windows.Point(xToPx(ordered.Last().X), yToPy(0)));
+                PlotCanvas.Children.Add(poly);
+            }
 
             // Plot line
             if (string.Equals(mode, "spline", StringComparison.OrdinalIgnoreCase) && data.Count >= 4)

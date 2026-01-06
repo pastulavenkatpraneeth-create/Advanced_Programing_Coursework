@@ -57,7 +57,12 @@ let isIdentChar c = Char.IsLetterOrDigit c || c = '_'
 let rec scanNumber chars acc =
   match chars with
   | c :: tail when isDigit c -> scanNumber tail (acc + string c)
-  | '.' :: tail when not (acc.Contains "." ) -> scanNumber tail (acc + ".")
+  | '.' :: tail when not (acc.Contains ".") -> scanNumber tail (acc + ".")
+  | ('e' | 'E') :: tail when not (acc.Contains "e" || acc.Contains "E") ->
+      match tail with
+      | sign :: t2 when sign = '+' || sign = '-' -> scanNumber t2 (acc + "E" + string sign)
+      | d :: _ when isDigit d -> scanNumber tail (acc + "E")
+      | _ -> chars, acc
   | _ -> chars, acc
 
 let rec scanIdent chars acc =
@@ -90,7 +95,7 @@ let lexer (input: string) : Token list =
         let (rest, numStr) = scanNumber cs ""
         match System.Double.TryParse numStr with
         | true, v ->
-            let hadDot = numStr.Contains "."
+            let hadDot = numStr.Contains "." || numStr.Contains "E" || numStr.Contains "e"
             Number (v, hadDot) :: scan rest
         | _ -> raise (LexError $"Invalid number: {numStr}")
     | other :: _ -> raise (LexError $"Unknown character: '{other}'")
@@ -137,6 +142,17 @@ let intMod a b =
   else a - b * intDiv a b
 
 // Parser
+let rec parseArgList tokens =
+  let (t1, v1, f1) = parseE tokens
+  let rec loop acc hasFloat toks =
+    match toks with
+    | Comma :: t ->
+        let (t2, v2, f2) = parseE t
+        loop (acc @ [v2]) (hasFloat || f2) t2
+    | Rpar :: t -> t, acc, hasFloat
+    | _ -> raise (ParseError "Expected ',' or ')' in argument list")
+  loop [v1] f1 t1
+
 let rec parseE tokens =
   let (tokens2, v1, hasFloat1) = parseT tokens
   parseEopt tokens2 v1 hasFloat1
@@ -414,6 +430,43 @@ and parseP tokens =
           plotRange <- Some (xL, xR)
           rest, y0, true
       | _ -> raise (ParseError "Expected comma in tangent arguments")
+  | Ident "dot" :: Lpar :: tail ->
+      let (rest, values, _) = parseArgList tail
+      if values.Length % 2 <> 0 then raise (EvalError "dot requires pairs of values")
+      let pairs =
+        values
+        |> List.chunkBySize 2
+        |> List.sumBy (fun pair -> pair[0] * pair[1])
+      rest, pairs, true
+  | Ident "norm" :: Lpar :: tail ->
+      let (rest, values, _) = parseArgList tail
+      let sumsq = values |> List.sumBy (fun v -> v * v)
+      rest, Math.Sqrt sumsq, true
+  | Ident "det" :: Lpar :: tail ->
+      let (rest, values, _) = parseArgList tail
+      match values.Length with
+      | 4 ->
+          let a = values[0]
+          let b = values[1]
+          let c = values[2]
+          let d = values[3]
+          rest, (a * d - b * c), true
+      | 9 ->
+          let a11 = values[0]
+          let a12 = values[1]
+          let a13 = values[2]
+          let a21 = values[3]
+          let a22 = values[4]
+          let a23 = values[5]
+          let a31 = values[6]
+          let a32 = values[7]
+          let a33 = values[8]
+          let det =
+            a11 * (a22 * a33 - a23 * a32)
+            - a12 * (a21 * a33 - a23 * a31)
+            + a13 * (a21 * a32 - a22 * a31)
+          rest, det, true
+      | _ -> raise (EvalError "det requires 4 (2x2) or 9 (3x3) values")
   | Ident name :: Lpar :: tail ->
       let (afterArg, argVal, argFloat) = parseE tail
       match afterArg with
@@ -583,3 +636,198 @@ let EvaluateExprForX (expr: string) (x: float) =
     | ParseError msg -> $"Parser error: {msg}"
     | EvalError msg -> $"Runtime error: {msg}"
     | ex -> $"Error: {ex.Message}"
+
+// Transpiler (INT5) - generate basic C# from interpreter syntax
+let rec parseArgListCs tokens =
+    let (t1, e1) = parseEcs tokens
+    let rec loop acc toks =
+        match toks with
+        | Comma :: t ->
+            let (t2, e2) = parseEcs t
+            loop (acc @ [e2]) t2
+        | Rpar :: t -> t, acc
+        | _ -> raise (ParseError "Expected ',' or ')' in C# argument list")
+    loop [e1] t1
+
+and parseEcs tokens =
+    let (t1, v1) = parseTcs tokens
+    parseEoptCs t1 v1
+
+and parseEoptCs tokens acc =
+    match tokens with
+    | Plus :: tail ->
+        let (t2, v2) = parseTcs tail
+        parseEoptCs t2 $"({acc} + {v2})"
+    | Minus :: tail ->
+        let (t2, v2) = parseTcs tail
+        parseEoptCs t2 $"({acc} - {v2})"
+    | _ -> tokens, acc
+
+and parseTcs tokens =
+    let (t1, v1) = parseFcs tokens
+    parseToptCs t1 v1
+
+and parseToptCs tokens acc =
+    match tokens with
+    | Mul :: tail ->
+        let (t2, v2) = parseFcs tail
+        parseToptCs t2 $"({acc} * {v2})"
+    | Div :: tail ->
+        let (t2, v2) = parseFcs tail
+        parseToptCs t2 $"({acc} / {v2})"
+    | Mod :: tail ->
+        let (t2, v2) = parseFcs tail
+        parseToptCs t2 $"({acc} % {v2})"
+    | _ -> tokens, acc
+
+and parseFcs tokens =
+    let (t1, v1) = parseUcs tokens
+    match t1 with
+    | Pow :: tail ->
+        let (t2, v2) = parseFcs tail
+        t2, $"Math.Pow({v1}, {v2})"
+    | _ -> t1, v1
+
+and parseUcs tokens =
+    match tokens with
+    | Minus :: tail ->
+        let (t2, v) = parseUcs tail
+        t2, $"(-{v})"
+    | Plus :: tail -> parseUcs tail
+    | _ -> parsePcs tokens
+
+and parsePcs tokens =
+    match tokens with
+    | Number (n, _) :: tail ->
+        let s = n.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
+        tail, s
+    | Ident name :: Lpar :: tail ->
+        let (rest, args) = parseArgListCs tail
+        let mapped =
+            match name.ToLowerInvariant() with
+            | "sin" -> "Math.Sin"
+            | "cos" -> "Math.Cos"
+            | "tan" -> "Math.Tan"
+            | "exp" -> "Math.Exp"
+            | "log" -> "Math.Log"
+            | "sqrt" -> "Math.Sqrt"
+            | "abs" -> "Math.Abs"
+            | "dot" -> "Dot"
+            | "norm" -> "Norm"
+            | "det" -> "Det"
+            | "plot" | "diff" | "integrate" | "root_bisect" | "root_newton" | "root_secant" | "tangent" ->
+                raise (ParseError $"Transpiler does not support builtin '{name}'")
+            | _ -> name
+        let argsJoined = String.Join(", ", args)
+        rest, $"{mapped}({argsJoined})"
+    | Ident name :: tail -> tail, name
+    | Lpar :: tail ->
+        let (t2, v) = parseEcs tail
+        match t2 with
+        | Rpar :: rest -> rest, $"({v})"
+        | _ -> raise (ParseError "Missing closing parenthesis in transpiler")
+    | _ -> raise (ParseError "Unexpected token in transpiler")
+
+let TranspileToCSharp (input: string) =
+    let lines =
+        input.Split([|'\n'; ';'|], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map (fun s -> s.Trim())
+        |> Array.filter (fun s -> s <> "")
+
+    let declarations = System.Collections.Generic.HashSet<string>()
+    let functions = System.Collections.Generic.List<string>()
+    let body = System.Collections.Generic.List<string>()
+
+    let addLine line = body.Add("    " + line)
+
+    for line in lines do
+        let tokens = lexer line
+        match tokens with
+        | Ident fname :: Lpar :: Ident param :: Rpar :: Assign :: rest ->
+            let (afterExpr, exprCs) = parseEcs rest
+            if afterExpr <> [] then raise (ParseError $"Extra tokens in function body of {fname}")
+            let funcDef = $"  static double {fname}(double {param}) {{ return {exprCs}; }}"
+            functions.Add(funcDef)
+        | Ident "for" :: Ident var :: Assign :: rest ->
+            let (tA, aExpr) = parseEcs rest
+            match tA with
+            | Ident "to" :: tB ->
+                let (tC, bExpr) = parseEcs tB
+                let (tD, stepExpr) =
+                    match tC with
+                    | Ident "step" :: tStep ->
+                        let (tBody, sExpr) = parseEcs tStep
+                        tBody, sExpr
+                    | _ -> tC, "1.0"
+                match tD with
+                | Ident "do" :: tBody ->
+                    let (afterBody, bodyExpr) = parseEcs tBody
+                    if afterBody <> [] then raise (ParseError "Extra tokens after for-loop body")
+                    addLine $"for (double {var} = {aExpr}; ({stepExpr}) >= 0 ? {var} <= {bExpr} : {var} >= {bExpr}; {var} += {stepExpr})"
+                    addLine "{"
+                    addLine $"  var _ = {bodyExpr};"
+                    addLine "}"
+                | _ -> raise (ParseError "Expected 'do' in for-loop")
+            | _ -> raise (ParseError "Expected 'to' in for-loop")
+        | Ident name :: Assign :: rest ->
+            let (afterExpr, exprCs) = parseEcs rest
+            if afterExpr <> [] then raise (ParseError $"Extra tokens after assignment of {name}")
+            if declarations.Add(name) then
+                addLine $"double {name} = {exprCs};"
+            else
+                addLine $"{name} = {exprCs};"
+        | _ ->
+            let (afterExpr, exprCs) = parseEcs tokens
+            if afterExpr <> [] then raise (ParseError "Extra tokens after expression")
+            addLine $"Console.WriteLine({exprCs});"
+
+    let helperMethods =
+        [
+            "  static double Dot(params double[] values)"
+            "  {"
+            "    if (values.Length % 2 != 0) throw new Exception(\"dot requires pairs of values\");"
+            "    double sum = 0;"
+            "    for (int i = 0; i < values.Length; i += 2) sum += values[i] * values[i + 1];"
+            "    return sum;"
+            "  }"
+            "  static double Norm(params double[] values)"
+            "  {"
+            "    double sum = 0;"
+            "    foreach (var v in values) sum += v * v;"
+            "    return Math.Sqrt(sum);"
+            "  }"
+            "  static double Det(params double[] values)"
+            "  {"
+            "    if (values.Length == 4)"
+            "    {"
+            "      return values[0] * values[3] - values[1] * values[2];"
+            "    }"
+            "    if (values.Length == 9)"
+            "    {"
+            "      double a11 = values[0], a12 = values[1], a13 = values[2];"
+            "      double a21 = values[3], a22 = values[4], a23 = values[5];"
+            "      double a31 = values[6], a32 = values[7], a33 = values[8];"
+            "      return a11 * (a22 * a33 - a23 * a32)"
+            "           - a12 * (a21 * a33 - a23 * a31)"
+            "           + a13 * (a21 * a32 - a22 * a31);"
+            "    }"
+            "    throw new Exception(\"det requires 4 or 9 values\");"
+            "  }"
+        ]
+
+    let code =
+        [
+            "using System;"
+            ""
+            "public static class Program"
+            "{"
+            yield! helperMethods
+            yield! functions
+            "  public static void Main()"
+            "  {"
+            yield! body
+            "  }"
+            "}"
+        ]
+
+    String.Join(Environment.NewLine, code)
