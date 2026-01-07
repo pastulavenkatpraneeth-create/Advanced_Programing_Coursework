@@ -296,48 +296,28 @@ namespace AP_Coursework_GUI
                 ErrorBox.Text = "Invalid range values. Use numbers for Xmin, Xmax, and Step.";
                 return;
             }
-            if (step <= 0 || xmax <= xmin)
+            if (step <= 0)
             {
-                ErrorBox.Text = "Ensure: Step > 0 and Xmax > Xmin.";
+                ErrorBox.Text = "Ensure: Step > 0.";
+                return;
+            }
+            if (xmax < xmin) { var tmp = xmin; xmin = xmax; xmax = tmp; }
+            if (Math.Abs(xmax - xmin) < 1e-12)
+            {
+                ErrorBox.Text = "X range too small.";
                 return;
             }
 
-            string input = InputTextBox.Text.Trim();
-            if (string.IsNullOrWhiteSpace(input))
-            {
-                ErrorBox.Text = "Enter definitions and a final expression in x to plot.";
-                return;
-            }
-
-            var lines = input.Split(new[] {'\n',';'}, StringSplitOptions.RemoveEmptyEntries)
-                             .Select(s => s.Trim())
-                             .Where(s => s.Length>0)
-                             .ToArray();
-            if (lines.Length == 0)
-            {
-                ErrorBox.Text = "Nothing to plot.";
-                return;
-            }
-            string expr = lines[lines.Length-1];
-            var setup = lines.Take(lines.Length-1).ToArray();
-
-            ExprEvaluator.ResetState();
-            foreach (var stmt in setup)
-            {
-                string res = ExprEvaluator.EvaluateExpression(stmt);
-                if (res.StartsWith("Lexer") || res.StartsWith("Parser") || res.StartsWith("Runtime") || res.StartsWith("Error"))
-                {
-                    ErrorBox.Text = $"Setup error: {res}";
-                    return;
-                }
-            }
+            if (!PrepareYDefinition(out var setupLines)) return;
 
             var points = new List<Point>();
             double x = xmin;
             int guard = 0;
-            while (x <= xmax + 1e-12 && guard < 100000)
+            // Cap total samples to avoid UI freeze
+            int maxSamples = 10000;
+            while (x <= xmax + 1e-12 && guard < maxSamples)
             {
-                string yStr = ExprEvaluator.EvaluateExprForX(expr, x);
+                string yStr = ExprEvaluator.EvaluateExprForX("y(x)", x);
                 if (yStr.StartsWith("Lexer") || yStr.StartsWith("Parser") || yStr.StartsWith("Runtime") || yStr.StartsWith("Error"))
                 {
                     ErrorBox.Text = $"At x={x.ToString("0.###", CultureInfo.InvariantCulture)}: {yStr}";
@@ -359,13 +339,12 @@ namespace AP_Coursework_GUI
 
             // Draw on embedded canvas in MainWindow
             DrawPlot(points, xmin, xmax);
-            _liveExpr = expr;
-            _liveSetup = setup;
-            double r = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-            if (r < 1e-9) r = 10.0;
-            _viewXmin = -r;
-            _viewXmax = r;
+            _liveExpr = "y(x)";
+            _liveSetup = setupLines;
+            _viewXmin = xmin;
+            _viewXmax = xmax;
             _hasLive = true;
+            // Reset transforms
             _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
             _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
             if (_livePlotEnabled)
@@ -576,11 +555,11 @@ namespace AP_Coursework_GUI
                 }
             }
 
-            // enforce symmetric x-range around 0 so (0,0) is centered
-            double r = Math.Max(Math.Abs(_viewXmin), Math.Abs(_viewXmax));
-            if (r < 1e-9) r = 10.0;
-            _viewXmin = -r;
-            _viewXmax = r;
+            // Keep current view range as-is; validate and widen minimally if degenerate
+            if (!double.IsFinite(_viewXmin) || !double.IsFinite(_viewXmax) || _viewXmax <= _viewXmin)
+            {
+                _viewXmin = -10.0; _viewXmax = 10.0;
+            }
 
             double width = Math.Max(PlotCanvas.ActualWidth, 10);
             int targetSamples = (int)Math.Clamp(Math.Round(width / 2.5), 200, 2000);
@@ -669,40 +648,26 @@ namespace AP_Coursework_GUI
         {
             if (PlotCanvas == null) return;
 
-            // Live mode: zoom symmetrically around 0 so origin stays centered
-            if (_livePlotEnabled && _hasLive)
-            {
-                double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
-                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1; // wheel up -> zoom in
-                double newRange = xrange / zoom;
-                double r = Math.Max(newRange / 2.0, 1e-6);
-                _viewXmin = -r;
-                _viewXmax = r;
-
-                // Reset transform to avoid double transforms
-                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-
-                ReplotCurrentView();
-                e.Handled = true;
-                return;
-            }
-
+            // Live mode: zoom around current center; do not force symmetry around 0
             if (_hasLive)
             {
                 double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
-                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
-                double newRange = xrange / zoom;
-                double r = Math.Max(newRange / 2.0, 1e-6);
-                _viewXmin = -r;
-                _viewXmax = r;
+                double center = (_viewXmin + _viewXmax) * 0.5;
+                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1; // wheel up -> zoom in
+                double newHalf = Math.Max(1e-6, (xrange / zoom) * 0.5);
+                _viewXmin = center - newHalf;
+                _viewXmax = center + newHalf;
+
+                // Keep transforms identity to avoid double transforms
                 _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
                 _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+
                 ReplotCurrentView();
                 e.Handled = true;
                 return;
             }
 
+            // No live plot: nothing to zoom; just reset transforms to identity
             _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
             _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
             e.Handled = true;
@@ -732,17 +697,26 @@ namespace AP_Coursework_GUI
             Vector delta = p - _lastPanPoint;
             _lastPanPoint = p;
 
-            if (_livePlotEnabled && _hasLive)
+            if (_hasLive)
             {
+                // Convert horizontal pixel delta to world delta and shift view range
+                double width = Math.Max(PlotCanvas.ActualWidth, 10);
+                double vis = Math.Max(10.0, width - 2 * PlotPad);
+                double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
+                double dxWorld = -delta.X * (xrange / vis);
+                _viewXmin += dxWorld;
+                _viewXmax += dxWorld;
+
+                // Keep transforms identity to avoid double transforms
                 _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
                 _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
                 ReplotCurrentView();
             }
             else
             {
+                // No live plot: just reset transforms
                 _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
                 _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-                if (_hasLive) ReplotCurrentView();
             }
             e.Handled = true;
         }
@@ -751,14 +725,13 @@ namespace AP_Coursework_GUI
         {
             if (_livePlotEnabled && _hasLive)
             {
-                // Reset world range to inputs or defaults
+                // Reset world range to user inputs exactly (swap if needed)
                 if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmin)) xmin = -10.0;
                 if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmax)) xmax = 10.0;
-                if (xmax <= xmin) { xmin = -10.0; xmax = 10.0; }
-                double r = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-                if (r < 1e-9) r = 10.0;
-                _viewXmin = -r;
-                _viewXmax = r;
+                if (xmax < xmin) { var t = xmin; xmin = xmax; xmax = t; }
+                if (Math.Abs(xmax - xmin) < 1e-12) { xmin -= 5.0; xmax += 5.0; }
+                _viewXmin = xmin;
+                _viewXmax = xmax;
                 _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
                 _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
                 ReplotCurrentView();
@@ -792,16 +765,25 @@ namespace AP_Coursework_GUI
             if (height < 50) height = 500;
             double pad = PlotPad;
 
-            // Symmetric ranges around 0
-            double xAbsMax = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-            if (xAbsMax < 1e-9) xAbsMax = 10.0;
-            double sxmin = -xAbsMax;
-            double sxmax = xAbsMax;
+            // Use provided X range; if invalid, expand minimally
+            double sxmin = xmin;
+            double sxmax = xmax;
+            if (!double.IsFinite(sxmin) || !double.IsFinite(sxmax) || sxmax <= sxmin)
+            {
+                sxmin = -10.0; sxmax = 10.0;
+            }
 
-            double yAbsMax = Math.Max(Math.Abs(data.Min(p => p.Y)), Math.Abs(data.Max(p => p.Y)));
-            if (yAbsMax < 1e-6) yAbsMax = 1.0;
-            double ymin = -yAbsMax;
-            double ymax = yAbsMax;
+            // Y range from data with padding
+            double dyMin = data.Min(p => p.Y);
+            double dyMax = data.Max(p => p.Y);
+            if (!double.IsFinite(dyMin) || !double.IsFinite(dyMax) || Math.Abs(dyMax - dyMin) < 1e-9)
+            {
+                double c = double.IsFinite(dyMin) ? dyMin : 0.0;
+                dyMin = c - 1.0; dyMax = c + 1.0;
+            }
+            double ypad = 0.05 * Math.Max(1e-9, Math.Abs(dyMax - dyMin));
+            double ymin = dyMin - ypad;
+            double ymax = dyMax + ypad;
 
             Func<double, double> xToPx = xv => pad + (xv - sxmin) / (sxmax - sxmin) * (width - 2 * pad);
             Func<double, double> yToPy = yv => height - pad - (yv - ymin) / (ymax - ymin) * (height - 2 * pad);
@@ -852,16 +834,21 @@ namespace AP_Coursework_GUI
                 }
             }
 
-            // Axes through center (0,0)
+            // Axes through (0,0) only if within range
+            if (0 >= sxmin && 0 <= sxmax)
             {
                 var x0 = xToPx(0);
                 var vline = new Line { X1 = x0, X2 = x0, Y1 = pad, Y2 = height - pad, Stroke = Brushes.Black, StrokeThickness = 1.5 };
                 PlotCanvas.Children.Add(vline);
+            }
+            if (0 >= ymin && 0 <= ymax)
+            {
                 var y0 = yToPy(0);
                 var hline = new Line { X1 = pad, X2 = width - pad, Y1 = y0, Y2 = y0, Stroke = Brushes.Black, StrokeThickness = 1.5 };
                 PlotCanvas.Children.Add(hline);
             }
             
+            // X ticks and labels
             {
                 double xrange = sxmax - sxmin;
                 double step = NiceStep(xrange);
@@ -883,6 +870,7 @@ namespace AP_Coursework_GUI
                 }
             }
             
+            // Y ticks and labels
             {
                 double yrange = ymax - ymin;
                 double step = NiceStep(yrange);
@@ -904,15 +892,15 @@ namespace AP_Coursework_GUI
                 }
             }
 
-            // Axes labels
+            // Axes labels (place near edges)
             var xLabel = new TextBlock { Text = "X", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.Black };
             PlotCanvas.Children.Add(xLabel);
             Canvas.SetLeft(xLabel, xToPx(sxmax) + 10);
-            Canvas.SetTop(xLabel, yToPy(0) + 8);
+            Canvas.SetTop(xLabel, height - pad + 8);
 
             var yLabel = new TextBlock { Text = "Y", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.Black };
             PlotCanvas.Children.Add(yLabel);
-            Canvas.SetLeft(yLabel, xToPx(0) - 14);
+            Canvas.SetLeft(yLabel, pad - 14);
             Canvas.SetTop(yLabel, yToPy(ymax) - 20);
 
             // Plot line

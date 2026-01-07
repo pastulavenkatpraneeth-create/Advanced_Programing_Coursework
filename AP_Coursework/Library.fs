@@ -689,8 +689,16 @@ let EvaluateExprForX (expr: string) (x: float) =
             symbolTable <- Map.empty
         if obj.ReferenceEquals(functionTable, null) then
             functionTable <- Map.empty
+        // To avoid artificial spikes in plotted curves caused by integer-division semantics
+        // (when both operands are considered integer-like at exact integer x), we nudge the
+        // evaluation point by a small epsilon so divisions like x/3 use floating division.
+        // Important: isClose() uses a threshold of 1e-10 to decide "int-like"; therefore eps must
+        // be significantly larger than 1e-10 to reliably break the tie at exact integers.
+        // This only affects plotting/numeric tool calls that use this helper, not general evaluation.
+        let eps = max 1e-8 (abs x * 1e-8)
+        let xAdj = x + eps
         let oldX = symbolTable.TryFind "x"
-        symbolTable <- symbolTable.Add("x", x)
+        symbolTable <- symbolTable.Add("x", xAdj)
         let tokens = lexer expr
         let (value, _) = parseAndEval tokens
         match oldX with
