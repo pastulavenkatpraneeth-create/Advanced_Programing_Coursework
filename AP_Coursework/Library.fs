@@ -1,5 +1,7 @@
 ﻿module ExprEvaluator
 open System
+open System.IO
+open System.Text
 
 // Tokens
 type Token =
@@ -55,10 +57,28 @@ let isWhite c = Char.IsWhiteSpace c
 let isIdentChar c = Char.IsLetterOrDigit c || c = '_'
 
 let rec scanNumber chars acc =
-  match chars with
-  | c :: tail when isDigit c -> scanNumber tail (acc + string c)
-  | '.' :: tail when not (acc.Contains "." ) -> scanNumber tail (acc + ".")
-  | _ -> chars, acc
+  // Scans: digits [ '.' digits ] [ ( 'e' | 'E' ) [ '+' | '-' ] digits ]
+  let rec scanIntPart cs ac =
+    match cs with
+    | c :: tail when isDigit c -> scanIntPart tail (ac + string c)
+    | '.' :: tail when not (ac.Contains ".") -> scanFracPart tail (ac + ".")
+    | 'e' :: tail | 'E' :: tail -> scanExpPart tail (ac + "e")
+    | _ -> cs, ac
+  and scanFracPart cs ac =
+    match cs with
+    | c :: tail when isDigit c -> scanFracPart tail (ac + string c)
+    | 'e' :: tail | 'E' :: tail -> scanExpPart tail (ac + "e")
+    | _ -> cs, ac
+  and scanExpPart cs ac =
+    match cs with
+    | '+' :: tail -> scanExpDigits tail (ac + "+")
+    | '-' :: tail -> scanExpDigits tail (ac + "-")
+    | _ -> scanExpDigits cs ac
+  and scanExpDigits cs ac =
+    match cs with
+    | c :: tail when isDigit c -> scanExpDigits tail (ac + string c)
+    | _ -> cs, ac
+  scanIntPart chars acc
 
 let rec scanIdent chars acc =
   match chars with
@@ -104,16 +124,25 @@ let mutable plotPoints : (float * float) list = []
 let mutable plotMode : string option = None
 let mutable plotRange : (float * float) option = None
 
+let mutable inExponentContext = false
+
 let rec pow baseF expF =
+  // Support integer and fractional exponents with domain checks
+  let isInt (x: float) = Math.Abs(x - Math.Round(x)) < 1e-12
   if expF = 0.0 then 1.0
   elif expF = 1.0 then baseF
-  elif expF > 1.0 then
-    let rec loop acc n =
-      if n <= 0 then acc else loop (acc * baseF) (n - 1)
-    loop 1.0 (int expF)
-  elif expF < 0.0 then 1.0 / pow baseF (-expF)
+  elif isInt expF then
+    // Fast integer exponent (handles negative exponent too)
+    let n = int (Math.Round expF)
+    if n >= 0 then
+      let rec loop acc k = if k <= 0 then acc else loop (acc * baseF) (k - 1)
+      loop 1.0 n
+    else
+      1.0 / (pow baseF (float -n))
   else
-    raise (EvalError "Fractional powers not supported without Math library")
+    // Fractional exponent
+    if baseF < 0.0 then raise (EvalError "Fractional power: negative base is not allowed")
+    else Math.Pow(baseF, expF)
 
 let absf x = if x >= 0.0 then x else -x
 
@@ -128,15 +157,157 @@ let isIntLike f =
 let intDiv a b =
   if b = 0.0 then raise (EvalError "Division by zero")
   else
+    // Truncate toward zero, like typical integer division in many languages
     let q = a / b
-    if q >= 0.0 then float (int q)
-    else float (int q + 1)
+    float (Math.Truncate q)
 
 let intMod a b =
   if b = 0.0 then raise (EvalError "Modulo by zero")
   else a - b * intDiv a b
 
 // Parser
+
+// --- Symbolic derivative support (LUT-based) ---
+
+type SExpr =
+  | SNum of float
+  | SVar
+  | SNeg of SExpr
+  | SAdd of SExpr * SExpr
+  | SSub of SExpr * SExpr
+  | SMul of SExpr * SExpr
+  | SDiv of SExpr * SExpr
+  | SPow of SExpr * SExpr
+  | SSin of SExpr
+  | SCos of SExpr
+  | STan of SExpr
+  | SExp of SExpr
+  | SLog of SExpr
+
+let rec parseSPrimary param tokens =
+  match tokens with
+  | Number (n, _) :: tail -> Some (SNum n, tail)
+  | Ident name :: Lpar :: tail ->
+      // support only unary functions for symbolic parsing
+      let nameL = name.ToLowerInvariant()
+      let opt = parseSExpr param tail
+      match opt with
+      | Some (arg, rest1) ->
+          match rest1 with
+          | Rpar :: rest2 ->
+              let node =
+                match nameL with
+                | "sin" -> Some (SSin arg)
+                | "cos" -> Some (SCos arg)
+                | "tan" -> Some (STan arg)
+                | "exp" -> Some (SExp arg)
+                | "log" -> Some (SLog arg)
+                | _ -> None
+              match node with
+              | Some n -> Some (n, rest2)
+              | None -> None
+          | _ -> None
+      | None -> None
+  | Ident name :: tail when name = param -> Some (SVar, tail)
+  | Lpar :: tail ->
+      match parseSExpr param tail with
+      | Some (e, rest) ->
+          match rest with | Rpar :: rest2 -> Some (e, rest2) | _ -> None
+      | None -> None
+  | _ -> None
+
+and parseSUnary param tokens =
+  match tokens with
+  | Minus :: tail ->
+      match parseSUnary param tail with
+      | Some (e, rest) -> Some (SNeg e, rest)
+      | None -> None
+  | _ -> parseSPrimary param tokens
+
+and parseSPower param tokens =
+  // left-assoc '^'
+  let rec loop acc toks =
+    match toks with
+    | Pow :: tail ->
+        match parseSUnary param tail with
+        | Some (rhs, rest) -> loop (SPow (acc, rhs)) rest
+        | None -> None
+    | _ -> Some (acc, toks)
+  match parseSUnary param tokens with
+  | Some (u, rest) -> loop u rest
+  | None -> None
+
+and parseSTerm param tokens =
+  let rec loop acc toks =
+    match toks with
+    | Mul :: tail ->
+        match parseSPower param tail with
+        | Some (rhs, rest) -> loop (SMul (acc, rhs)) rest
+        | None -> None
+    | Div :: tail ->
+        match parseSPower param tail with
+        | Some (rhs, rest) -> loop (SDiv (acc, rhs)) rest
+        | None -> None
+    | _ -> Some (acc, toks)
+  match parseSPower param tokens with
+  | Some (f, rest) -> loop f rest
+  | None -> None
+
+and parseSExpr param tokens =
+  let rec loop acc toks =
+    match toks with
+    | Plus :: tail ->
+        match parseSTerm param tail with
+        | Some (rhs, rest) -> loop (SAdd (acc, rhs)) rest
+        | None -> None
+    | Minus :: tail ->
+        match parseSTerm param tail with
+        | Some (rhs, rest) -> loop (SSub (acc, rhs)) rest
+        | None -> None
+    | _ -> Some (acc, toks)
+  match parseSTerm param tokens with
+  | Some (t, rest) -> loop t rest
+  | None -> None
+
+let rec sdiff expr =
+  match expr with
+  | SNum _ -> SNum 0.0
+  | SVar -> SNum 1.0
+  | SNeg u -> SNeg (sdiff u)
+  | SAdd (a,b) -> SAdd (sdiff a, sdiff b)
+  | SSub (a,b) -> SSub (sdiff a, sdiff b)
+  | SMul (u,v) -> SAdd (SMul (sdiff u, v), SMul (u, sdiff v))
+  | SDiv (u,v) -> SDiv (SSub (SMul (sdiff u, v), SMul (u, sdiff v)), SPow (v, SNum 2.0))
+  | SPow (u, v) ->
+      match v with
+      | SNum n -> SMul (SMul (SNum n, SPow (u, SNum (n - 1.0))), sdiff u)
+      | _ ->
+          // d(u^v) = u^v * (v' * log u + v * u'/u)
+          // domain of log(u) left to runtime
+          let term1 = SMul (sdiff v, SLog u)
+          let term2 = SDiv (SMul (v, sdiff u), u)
+          SMul (SPow (u, v), SAdd (term1, term2))
+  | SSin u -> SMul (SCos u, sdiff u)
+  | SCos u -> SNeg (SMul (SSin u, sdiff u))
+  | STan u -> SDiv (sdiff u, SPow (SCos u, SNum 2.0))
+  | SExp u -> SMul (SExp u, sdiff u)
+  | SLog u -> SDiv (sdiff u, u)
+
+let rec seval x expr =
+  match expr with
+  | SNum n -> n
+  | SVar -> x
+  | SNeg u -> - (seval x u)
+  | SAdd (a,b) -> (seval x a) + (seval x b)
+  | SSub (a,b) -> (seval x a) - (seval x b)
+  | SMul (a,b) -> (seval x a) * (seval x b)
+  | SDiv (a,b) -> (seval x a) / (seval x b)
+  | SPow (a,b) -> Math.Pow(seval x a, seval x b)
+  | SSin u -> Math.Sin (seval x u)
+  | SCos u -> Math.Cos (seval x u)
+  | STan u -> Math.Tan (seval x u)
+  | SExp u -> Math.Exp (seval x u)
+  | SLog u -> Math.Log (seval x u)
 let rec parseE tokens =
   let (tokens2, v1, hasFloat1) = parseT tokens
   parseEopt tokens2 v1 hasFloat1
@@ -164,9 +335,12 @@ and parseTopt tokens acc hasFloat =
       let (t2, v2, f2) = parseF tail
       if v2 = 0.0 then raise (EvalError "Division by zero")
       let result =
-        if (not hasFloat) && (isIntLike acc) && (isIntLike v2) then intDiv acc v2
+        if inExponentContext then acc / v2
+        // Use integer division ONLY if both sides are int-like AND neither side came from a float context
+        elif (not hasFloat) && (not f2) && (isIntLike acc) && (isIntLike v2) then intDiv acc v2
         else acc / v2
-      parseTopt t2 result (hasFloat || f2 || not (isIntLike acc && isIntLike v2))
+      // Update float flag: division yields float if any side is float-like or in exponent context
+      parseTopt t2 result (hasFloat || f2 || inExponentContext || not (isIntLike acc && isIntLike v2))
   | Mod :: tail ->
       let (t2, v2, f2) = parseF tail
       let result = intMod acc v2
@@ -174,14 +348,20 @@ and parseTopt tokens acc hasFloat =
   | _ -> tokens, acc, hasFloat
 
 and parseF tokens =
+  // Left-associative power: (((a ^ b) ^ c) ^ d)
   let (t2, v1, f1) = parseU tokens
-  match t2 with
-  | Pow :: tail ->
-      let (t3, v2, f2) = parseF tail
-      let res = pow v1 v2
-      let resFloat = (not (isIntLike res)) || f1 || f2
-      t3, res, resFloat
-  | _ -> t2, v1, f1
+  let rec loop acc accF toks =
+    match toks with
+    | Pow :: tail ->
+        let prevCtx = inExponentContext
+        inExponentContext <- true
+        let (tNext, v2, f2) = parseU tail
+        inExponentContext <- prevCtx
+        let res = pow acc v2
+        let resF = true // power generally yields float domain; treat as float to avoid integer artifacts
+        loop res resF tNext
+    | _ -> toks, acc, accF
+  loop v1 f1 t2
 
 and parseU tokens =
   match tokens with
@@ -211,8 +391,55 @@ and parseP tokens =
         | None -> symbolTable <- symbolTable.Remove param
         result
     | None -> raise (EvalError "Undefined function: y(x) not defined")
+  // Parse a comma-separated argument list into floats until ')'
+  let rec parseArgs acc toks =
+    let (t1, v, _) = parseE toks
+    let acc2 = v :: acc
+    match t1 with
+    | Comma :: t2 -> parseArgs acc2 t2
+    | Rpar :: rest -> List.rev acc2, rest
+    | _ -> raise (ParseError "Expected ',' or ')' in argument list")
   match tokens with
   | Number (n, hadDot) :: tail -> tail, n, (hadDot || not (isIntLike n))
+  // Vector/Matrix helpers and shading
+  | Ident "dot" :: Lpar :: tail ->
+      let (args, rest) = parseArgs [] tail
+      if args.Length < 2 || args.Length % 2 <> 0 then raise (EvalError "dot expects an even number of arguments >= 2: dot(a1,b1[,a2,b2,...])")
+      let half = args.Length / 2
+      let mutable sum = 0.0
+      for i in 0 .. half - 1 do
+        sum <- sum + args[i] * args[i + half]
+      rest, sum, true
+  | Ident "norm" :: Lpar :: tail ->
+      let (args, rest) = parseArgs [] tail
+      if args.Length < 1 then raise (EvalError "norm expects at least 1 argument")
+      let mutable s = 0.0
+      for v in args do s <- s + v * v
+      rest, Math.Sqrt(s), true
+  | Ident "det" :: Lpar :: tail ->
+      let (args, rest) = parseArgs [] tail
+      match args.Length with
+      | 4 ->
+          let a,b,c,d = args[0], args[1], args[2], args[3]
+          rest, (a*d - b*c), true
+      | 9 ->
+          let a11,a12,a13,a21,a22,a23,a31,a32,a33 = args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8]
+          let det3 = a11*(a22*a33 - a23*a32) - a12*(a21*a33 - a23*a31) + a13*(a21*a32 - a22*a31)
+          rest, det3, true
+      | _ -> raise (EvalError "det expects 4 (2x2) or 9 (3x3) arguments")
+  | Ident "shade" :: Lpar :: tail ->
+      // shade(a,b) marks an interval for GUI area fill; returns length (b-a)
+      let (t1, a, _) = parseE tail
+      match t1 with
+      | Comma :: t2 ->
+          let (t3, b, _) = parseE t2
+          match t3 with
+          | Rpar :: rest ->
+              let aa, bb = if a <= b then a, b else b, a
+              plotRange <- Some (aa, bb)
+              rest, (bb - aa), true
+          | _ -> raise (ParseError "Expected ')' in shade")
+      | _ -> raise (ParseError "Expected comma in shade arguments")
   | Ident "plot" :: Lpar :: tail ->
       // parse plot(x, dx, mode)
       let (t1, xVal, _) = parseE tail
@@ -229,7 +456,7 @@ and parseP tokens =
           | _ -> raise (ParseError "Expected: plot(x, dx, mode)")
       | _ -> raise (ParseError "Expected comma in plot arguments")
   | Ident "diff" :: Lpar :: tail ->
-      // diff(x0[, h]) numeric derivative of y at x0 (central difference)
+      // diff(x0[, h]) derivative of y at x0: try symbolic LUT first; fallback to numeric central difference
       let (t1, x0, _) = parseE tail
       let h, rest =
         match t1 with
@@ -240,10 +467,56 @@ and parseP tokens =
             | Rpar :: rest -> hVal, rest
             | _ -> raise (ParseError "Expected closing ')' in diff")
         | _ -> raise (ParseError "Expected ',' or ')' in diff")
-      let yph = evalYAt (x0 + h)
-      let ymh = evalYAt (x0 - h)
-      let d = (yph - ymh) / (2.0 * h)
-      rest, d, true
+      match functionTable.TryFind "y" with
+      | Some (param, body) ->
+          match parseSExpr param body with
+          | Some (sexpr, []) ->
+              // Evaluate symbolic derivative at x0
+              let dsexpr = sdiff sexpr
+              let value = seval x0 dsexpr
+              // Mark a small symmetric interval around x0 for GUI shading
+              let w = if h > 0.0 then Math.Max(5.0 * h, 0.5) else 0.5
+              plotRange <- Some (x0 - w, x0 + w)
+              rest, value, true
+          | _ ->
+              // fallback numeric
+              let yph = evalYAt (x0 + h)
+              let ymh = evalYAt (x0 - h)
+              let d = (yph - ymh) / (2.0 * h)
+              // Mark a small symmetric interval around x0 for GUI shading
+              let w = if h > 0.0 then Math.Max(5.0 * h, 0.5) else 0.5
+              plotRange <- Some (x0 - w, x0 + w)
+              rest, d, true
+      | None -> raise (EvalError "Undefined function: y(x) not defined")
+  | Ident "sdiff" :: Lpar :: tail ->
+      // Backward-compatible alias of diff(x0[,h]). Prefer using diff.
+      let (t1, x0, _) = parseE tail
+      let h, rest =
+        match t1 with
+        | Rpar :: rest -> 1e-5, rest
+        | Comma :: t2 ->
+            let (t3, hVal, _) = parseE t2
+            match t3 with
+            | Rpar :: rest -> hVal, rest
+            | _ -> raise (ParseError "Expected closing ')' in sdiff")
+        | _ -> raise (ParseError "Expected ',' or ')' in sdiff")
+      match functionTable.TryFind "y" with
+      | Some (param, body) ->
+          match parseSExpr param body with
+          | Some (sexpr, []) ->
+              let dsexpr = sdiff sexpr
+              let value = seval x0 dsexpr
+              let w = if h > 0.0 then Math.Max(5.0 * h, 0.5) else 0.5
+              plotRange <- Some (x0 - w, x0 + w)
+              rest, value, true
+          | _ ->
+              let yph = evalYAt (x0 + h)
+              let ymh = evalYAt (x0 - h)
+              let d = (yph - ymh) / (2.0 * h)
+              let w = if h > 0.0 then Math.Max(5.0 * h, 0.5) else 0.5
+              plotRange <- Some (x0 - w, x0 + w)
+              rest, d, true
+      | None -> raise (EvalError "Undefined function: y(x) not defined")
   | Ident "integrate" :: Lpar :: tail ->
       // integrate(a, b[, n]) trapezoidal rule on y(x)
       let (t1, a, _) = parseE tail
@@ -269,6 +542,7 @@ and parseP tokens =
             sum <- sum + evalYAt x
             i <- i + 1
           let area = (h/2.0) * (evalYAt aa + 2.0*sum + evalYAt bb)
+          plotRange <- Some (aa, bb) // mark range for GUI shading
           rest, area, true
       | _ -> raise (ParseError "Expected comma in integrate arguments")
   | Ident "root_bisect" :: Lpar :: tail ->
@@ -325,7 +599,9 @@ and parseP tokens =
               lo <- mid
               flo <- fmid
             iter <- iter + 1
-          rest, mid, true
+          // normalize very small roots to 0 for stable output
+          let rootB = if absf mid < Math.Max(tol, 1e-12) then 0.0 else mid
+          rest, rootB, true
       | _ -> raise (ParseError "Expected comma in root_bisect arguments")
   | Ident "root_newton" :: Lpar :: tail ->
       // root_newton(x0[, tol][, maxIter]) using numeric derivative
@@ -354,7 +630,8 @@ and parseP tokens =
         if d = 0.0 then raise (EvalError "Zero derivative in Newton method")
         x <- x - fx / d
         i <- i + 1
-      rest, x, true
+      let rootN = if absf x < Math.Max(tol, 1e-12) then 0.0 else x
+      rest, rootN, true
   | Ident "root_secant" :: Lpar :: tail ->
       // root_secant(x0, x1[, tol][, maxIter])
       let (t1, x0, _) = parseE tail
@@ -389,10 +666,11 @@ and parseP tokens =
             xCurr <- xNext
             fCurr <- evalYAt xCurr
             i <- i + 1
-          rest, xCurr, true
+          let rootS = if absf xCurr < Math.Max(tol, 1e-12) then 0.0 else xCurr
+          rest, rootS, true
       | _ -> raise (ParseError "Expected comma in root_secant arguments")
   | Ident "tangent" :: Lpar :: tail ->
-      // tangent(x0, halfWidth[, mode]) – buffers a short tangent segment for plotting
+      // tangent(x0, halfWidth[, mode]) – buffers a short tangent segment for plotting and shades its local interval
       let (t1, x0, _) = parseE tail
       match t1 with
       | Comma :: t2 ->
@@ -411,10 +689,14 @@ and parseP tokens =
           let yR = y0 + d * (xR - x0)
           plotPoints <- (xL, yL) :: (xR, yR) :: plotPoints
           plotMode <- Some(modeStr)
-          plotRange <- Some (xL, xR)
+          // Set plotRange so GUI shades this local interval
+          let a = Math.Min(xL, xR)
+          let b = Math.Max(xL, xR)
+          plotRange <- Some (a, b)
           rest, y0, true
       | _ -> raise (ParseError "Expected comma in tangent arguments")
   | Ident name :: Lpar :: tail ->
+      // Try single-argument call first (user-defined or built-in 1-arg)
       let (afterArg, argVal, argFloat) = parseE tail
       match afterArg with
       | Rpar :: rest ->
@@ -433,21 +715,20 @@ and parseP tokens =
               | None -> symbolTable <- symbolTable.Remove param
               rest, result, (argFloat || resFloat)
           | None ->
-              // Built-in unary math functions (radians)
+              // Built-ins (unary and var-args)
               let low = name.ToLowerInvariant()
-              let applyBuiltin (f: float -> float) =
+              let applyUnary (f: float -> float) =
                   let r = f argVal
                   rest, r, true
               match low with
-              | "sin" -> applyBuiltin Math.Sin
-              | "cos" -> applyBuiltin Math.Cos
-              | "tan" -> applyBuiltin Math.Tan
-              | "exp" -> applyBuiltin Math.Exp
-              | "log" -> if argVal <= 0.0 then raise (EvalError "log domain error") else applyBuiltin Math.Log
-              | "sqrt" -> if argVal < 0.0 then raise (EvalError "sqrt domain error") else applyBuiltin Math.Sqrt
-              | "abs" -> applyBuiltin absf
-              | _ -> raise (EvalError $"Undefined function: {name}")
-      | _ -> raise (ParseError "Missing closing parenthesis")
+              | "sin" -> applyUnary Math.Sin
+              | "cos" -> applyUnary Math.Cos
+              | "tan" -> applyUnary Math.Tan
+              | "exp" -> applyUnary Math.Exp
+              | "log" -> if argVal <= 0.0 then raise (EvalError "log domain error") else applyUnary Math.Log
+              | "sqrt" -> if argVal < 0.0 then raise (EvalError "sqrt domain error") else applyUnary Math.Sqrt
+              | "abs" -> applyUnary absf
+              | _ -> raise (EvalError $"Undefined function or wrong arity: {name}")
   | Ident name :: tail ->
       match symbolTable.TryFind name with
       | Some v -> tail, v, (not (isIntLike v))
@@ -482,7 +763,7 @@ let parseAndEval tokens =
             match tBodyStart with
             | Ident "do" :: body ->
                 if stepVal = 0.0 then raise (EvalError "Step must be non-zero")
-                plotRange <- Some (a, b)
+                // Do not set plotRange here; shading should only be set by integrate/shade
                 let compare = if stepVal > 0.0 then (fun x -> x <= b + 1e-12) else (fun x -> x >= b - 1e-12)
                 let mutable x = a
                 let mutable lastRes = 0.0
@@ -524,6 +805,9 @@ let EvaluateExpression (input: string) =
             symbolTable <- Map.empty
         if obj.ReferenceEquals(functionTable, null) then
             functionTable <- Map.empty
+        // Reset shading at the start of each evaluation batch so only this batch's
+        // integrate/shade calls can enable area fill on the GUI.
+        plotRange <- None
 
         let lines = 
             input.Split([|'\n'; ';'|], StringSplitOptions.RemoveEmptyEntries)
@@ -542,7 +826,7 @@ let EvaluateExpression (input: string) =
         // Normalize tiny values to +0.0 to avoid "-0" in output
         if absf lastResult < 5e-13 then lastResult <- 0.0
 
-        if isFloat then lastResult.ToString("0.0###", System.Globalization.CultureInfo.InvariantCulture)
+        if isFloat then lastResult.ToString("G17", System.Globalization.CultureInfo.InvariantCulture)
         else lastResult.ToString("0", System.Globalization.CultureInfo.InvariantCulture)
 
     with
@@ -562,7 +846,165 @@ let HasPlotData () = plotPoints <> []
 let GetPlotData () = plotPoints |> List.rev |> List.toArray
 let GetPlotMode () = match plotMode with | Some m -> m | None -> "linear"
 let GetPlotRange () = match plotRange with | Some (a,b) -> (a,b) | None -> (0.0,1.0)
+let HasShadingRange () = match plotRange with | Some _ -> true | None -> false
 let ClearPlotData () = plotPoints <- []; plotMode <- None; plotRange <- None
+
+// -------- Transpiler to C# (INT5) --------
+
+let private genModuloExpr (a:string) (b:string) =
+    // emulate intMod semantics on doubles: a - b * Truncate(a/b)
+    $"({a} - {b} * System.Math.Truncate({a} / {b}))"
+
+let rec private genPrimary (tokens: Token list) : (string * Token list) =
+    match tokens with
+    | Number (n, hadDot) :: tail ->
+        let s = n.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        (s, tail)
+    | Ident name :: Lpar :: tail ->
+        // one-argument function call
+        let (argStr, rest1) =
+            let (s, rest) = genExpr tail in
+            match rest with
+            | Rpar :: rest2 -> s, rest2
+            | _ -> raise (ParseError $"Missing ')' after argument of {name}")
+        let low = name.ToLowerInvariant()
+        let call =
+            match low with
+            | "sin" -> $"System.Math.Sin({argStr})"
+            | "cos" -> $"System.Math.Cos({argStr})"
+            | "tan" -> $"System.Math.Tan({argStr})"
+            | "exp" -> $"System.Math.Exp({argStr})"
+            | "log" -> $"System.Math.Log({argStr})"
+            | "sqrt" -> $"System.Math.Sqrt({argStr})"
+            | "abs" -> $"System.Math.Abs({argStr})"
+            | _ -> $"{name}({argStr})" // user-defined function
+        call, rest1
+    | Ident name :: tail ->
+        // variable (e.g., parameter)
+        name, tail
+    | Lpar :: tail ->
+        let (s, rest) = genExpr tail
+        match rest with
+        | Rpar :: rest2 -> $"({s})", rest2
+        | _ -> raise (ParseError "Missing closing parenthesis")
+    | _ -> raise (ParseError "Unexpected token in primary for codegen")
+
+and private genUnary tokens : (string * Token list) =
+    match tokens with
+    | Minus :: tail ->
+        let (s, rest) = genUnary tail
+        $"(-{s})", rest
+    | Plus :: tail -> genUnary tail
+    | _ -> genPrimary tokens
+
+and private genPower tokens : (string * Token list) =
+    // left-assoc '^' → nest Math.Pow accordingly
+    let (uStr, t1) = genUnary tokens
+    let rec loop acc toks =
+        match toks with
+        | Pow :: tail ->
+            let (rhs, rest) = genUnary tail
+            let accStr = $"System.Math.Pow({acc}, {rhs})"
+            loop accStr rest
+        | _ -> acc, toks
+    loop uStr t1
+
+and private genTerm tokens : (string * Token list) =
+    let (fStr, t1) = genPower tokens
+    let rec loop acc toks =
+        match toks with
+        | Mul :: tail ->
+            let (rhs, rest) = genPower tail
+            loop ($"({acc} * {rhs})") rest
+        | Div :: tail ->
+            let (rhs, rest) = genPower tail
+            loop ($"({acc} / {rhs})") rest
+        | Mod :: tail ->
+            let (rhs, rest) = genPower tail
+            loop (genModuloExpr acc rhs) rest
+        | _ -> acc, toks
+    loop fStr t1
+
+and private genExpr tokens : (string * Token list) =
+    let (tStr, t1) = genTerm tokens
+    let rec loop acc toks =
+        match toks with
+        | Plus :: tail ->
+            let (rhs, rest) = genTerm tail
+            loop ($"({acc} + {rhs})") rest
+        | Minus :: tail ->
+            let (rhs, rest) = genTerm tail
+            loop ($"({acc} - {rhs})") rest
+        | _ -> acc, toks
+    loop tStr t1
+
+let private tryParseFuncDef (tokens: Token list) : (string * string * Token list) option =
+    match tokens with
+    | Ident fname :: Lpar :: Ident param :: Rpar :: Assign :: rest -> Some (fname, param, rest)
+    | _ -> None
+
+let private generateMethod (name:string) (param:string) (bodyTokens: Token list) : string =
+    let (bodyExpr, rest) = genExpr bodyTokens
+    if rest <> [] then raise (ParseError $"Extra tokens after body of {name}")
+    // sanitize parameter and references: assume 'x' for main; leave as-is
+    $"    public static double {name}(double {param}) => {bodyExpr};"
+
+let TranspileToCSharp (source: string) : string =
+    try
+        // collect function defs
+        let lines = 
+            source.Split([|'\n'; ';'|], StringSplitOptions.RemoveEmptyEntries)
+            |> Array.map (fun s -> s.Trim())
+            |> Array.filter (fun s -> s <> "")
+        if lines.Length = 0 then raise (ParseError "Empty source")
+        let mutable defs : (string * string * Token list) list = []
+        for line in lines do
+            let toks = lexer line
+            match tryParseFuncDef toks with
+            | Some def -> defs <- def :: defs
+            | None -> () // ignore other statements for compiler
+        let defs = defs |> List.rev
+        // choose entry function: y if present, else the first defined function
+        let entryNameOpt =
+            defs |> List.tryFind (fun (n,_,_) -> String.Equals(n, "y", StringComparison.OrdinalIgnoreCase))
+            |> Option.orElse (defs |> List.tryHead)
+        let entryName =
+            match entryNameOpt with
+            | Some (n,_,_) -> n
+            | None -> raise (EvalError "Transpiler requires at least one function definition, e.g., f(x)=x^2+1")
+        // generate methods
+        let sb = StringBuilder()
+        sb.AppendLine("using System;") |> ignore
+        sb.AppendLine("using System.Globalization;") |> ignore
+        sb.AppendLine("namespace GeneratedMath") |> ignore
+        sb.AppendLine("{") |> ignore
+        sb.AppendLine("  public static class UserFuncs") |> ignore
+        sb.AppendLine("  {") |> ignore
+        for (n,p,b) in defs do
+            let methodLine = generateMethod n p b
+            sb.AppendLine(methodLine) |> ignore
+        sb.AppendLine("    public static int Main(string[] args)") |> ignore
+        sb.AppendLine("    {") |> ignore
+        sb.AppendLine("      try {") |> ignore
+        sb.AppendLine("        if (args.Length == 1)") |> ignore
+        sb.AppendLine("        {") |> ignore
+        sb.AppendLine("          var x = double.Parse(args[0], CultureInfo.InvariantCulture);") |> ignore
+        sb.AppendLine($"          var yv = {entryName}(x);") |> ignore
+        sb.AppendLine("          Console.WriteLine(yv.ToString(\"G17\", CultureInfo.InvariantCulture));") |> ignore
+        sb.AppendLine("          return 0;") |> ignore
+        sb.AppendLine("        }") |> ignore
+        sb.AppendLine($"        Console.WriteLine(\"Usage: <exe> <x>    // evaluates {entryName}(x)\");") |> ignore
+        sb.AppendLine("        return 1;") |> ignore
+        sb.AppendLine("      } catch (Exception ex) { Console.Error.WriteLine(ex.Message); return 2; }") |> ignore
+        sb.AppendLine("    }") |> ignore
+        sb.AppendLine("  }") |> ignore
+        sb.AppendLine("}") |> ignore
+        sb.ToString()
+    with
+    | LexError msg -> $"CSharp error: Lexer error: {msg}"
+    | ParseError msg -> $"CSharp error: Parser error: {msg}"
+    | EvalError msg -> $"CSharp error: Runtime error: {msg}"
+    | ex -> $"CSharp error: {ex.Message}"
 
 let EvaluateExprForX (expr: string) (x: float) =
     try
@@ -570,10 +1012,17 @@ let EvaluateExprForX (expr: string) (x: float) =
             symbolTable <- Map.empty
         if obj.ReferenceEquals(functionTable, null) then
             functionTable <- Map.empty
+        // Nudge x slightly to avoid integer-like artifacts in plotting (e.g., x/3 at integer x)
+        // isClose uses ~1e-10, so pick eps significantly larger to reliably break ties
+        let eps = Math.Max(1e-8, Math.Abs(x) * 1e-8)
+        let xAdj = x + eps
         let oldX = symbolTable.TryFind "x"
-        symbolTable <- symbolTable.Add("x", x)
-        let tokens = lexer expr
+        symbolTable <- symbolTable.Add("x", xAdj)
+        // Force float context during plotting by wrapping expression in 1.0*( ... )
+        let exprFloat = "(1.0*(" + expr + "))"
+        let tokens = lexer exprFloat
         let (value, _) = parseAndEval tokens
+        // Restore previous x binding
         match oldX with
         | Some v -> symbolTable <- symbolTable.Add("x", v)
         | None -> symbolTable <- symbolTable.Remove "x"
