@@ -73,6 +73,29 @@ namespace AP_Coursework_GUI
             };
         }
 
+        private string PreprocessYAssignment(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return input;
+            var lines = input.Split(new[] { '\n', ';' }, StringSplitOptions.None);
+            var sb = new StringBuilder();
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var raw = lines[i];
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                var line = raw.Trim();
+                var mFunc = Regex.Match(line, @"^[A-Za-z]\w*\s*\(\s*[A-Za-z]\w*\s*\)\s*=");
+                var mYAssign = Regex.Match(line, @"^y\s*=\s*(.+)$", RegexOptions.IgnoreCase);
+                if (!mFunc.Success && mYAssign.Success)
+                {
+                    string rhs = mYAssign.Groups[1].Value.Trim();
+                    line = $"y(x) = {rhs}";
+                }
+                if (sb.Length > 0) sb.AppendLine(";");
+                sb.Append(line);
+            }
+            return sb.ToString();
+        }
+        
         private void Evaluate_Click(object sender, RoutedEventArgs e)
         {
 
@@ -84,6 +107,7 @@ namespace AP_Coursework_GUI
             }
             try
             {
+                input = PreprocessYAssignment(input);
                 string result = ExprEvaluator.EvaluateExpression(input);
                 if (result.StartsWith("Lexer") || result.StartsWith("Parser") ||
                    result.StartsWith("Runtime") || result.StartsWith("Error"))
@@ -193,6 +217,7 @@ namespace AP_Coursework_GUI
             }
 
             string input = InputTextBox.Text.Trim();
+            input = PreprocessYAssignment(input);
             if (string.IsNullOrWhiteSpace(input))
             {
                 ErrorBox.Text = "Enter definitions and expressions to plot.";
@@ -210,45 +235,73 @@ namespace AP_Coursework_GUI
             }
             
             var funcDefs = lines
-                .Select(l => Regex.Match(l, "^\\s*([A-Za-z]\\w*)\\s*\\(\\s*([A-Za-z]\\w*)\\s*\\)\\s*=").Groups)
+                .Select(l => Regex.Match(l, @"^\s*([A-Za-z]\w*)\s*\(\s*([A-Za-z]\w*)\s*\)\s*=").Groups)
                 .Where(g => g.Count > 2 && !string.IsNullOrEmpty(g[1].Value))
                 .Select(g => (name: g[1].Value.Trim(), param: g[2].Value.Trim()))
                 .Distinct()
                 .ToList();
+
+            var verticalLines = lines
+                .Select(l => Regex.Match(l, @"^x\s*=\s*([^;]+)$", RegexOptions.IgnoreCase))
+                .Where(m => m.Success)
+                .Select(m => m.Groups[1].Value.Trim())
+                .ToList();
             
             var newSeries = new List<Series>();
-            if (funcDefs.Count > 0)
+            int paletteIdx = _series.Count;
+
+            if (funcDefs.Count > 0 || verticalLines.Count > 0)
             {
-                int idx = 0;
                 foreach (var fd in funcDefs)
                 {
-                    var s = new Series
+                    newSeries.Add(new Series
                     {
                         Setup = lines,
                         Expr = $"{fd.name}(x)",
                         Mode = "linear",
-                        Stroke = _palette[idx % _palette.Length]
-                    };
-                    newSeries.Add(s);
-                    idx++;
+                        Stroke = _palette[paletteIdx++ % _palette.Length]
+                    });
+                }
+                foreach (var v in verticalLines)
+                {
+                    newSeries.Add(new Series
+                    {
+                        Setup = lines,
+                        Expr = v,
+                        Mode = "vertical",
+                        Stroke = _palette[paletteIdx++ % _palette.Length]
+                    });
                 }
             }
             else
             {
                 string expr = lines[lines.Length - 1];
-                if (Regex.IsMatch(expr, "^\\s*[A-Za-z]\\w*\\s*\\(\\s*[A-Za-z]\\w*\\s*\\)\\s*="))
+                if (Regex.IsMatch(expr, @"^\s*[A-Za-z]\w*\s*\(\s*[A-Za-z]\w*\s*\)\s*="))
                 {
                     ErrorBox.Text = "The last line is a function definition. Define functions and click Plot again, or put an expression in x on the last line.";
                     return;
                 }
-                var s = new Series
+                var mVertical = Regex.Match(expr, @"^x\s*=\s*(.+)$", RegexOptions.IgnoreCase);
+                if (mVertical.Success)
                 {
-                    Setup = lines.Take(lines.Length - 1).ToArray(),
-                    Expr = expr,
-                    Mode = "linear",
-                    Stroke = _palette[_series.Count % _palette.Length]
-                };
-                newSeries.Add(s);
+                    newSeries.Add(new Series
+                    {
+                        Setup = lines.Take(lines.Length - 1).ToArray(),
+                        Expr = mVertical.Groups[1].Value.Trim(),
+                        Mode = "vertical",
+                        Stroke = _palette[paletteIdx % _palette.Length]
+                    });
+                }
+                else
+                {
+                    newSeries.Add(new Series
+                    {
+                        Setup = lines.Take(lines.Length - 1).ToArray(),
+                        Expr = expr,
+                        Mode = "linear",
+                        Stroke = _palette[paletteIdx % _palette.Length]
+                    });
+                }
             }
 
             // Append new series to the plot collection with de-duplication by Expr label
@@ -524,7 +577,7 @@ namespace AP_Coursework_GUI
             double step = xrange / Math.Max(1, (targetSamples - 1));
 
             // Sample each series independently with its setup
-            var seriesData = new List<(List<Point> Data, Brush Stroke, string Label)>();
+            var seriesData = new List<(List<Point> Data, Brush Stroke, string Label, string Mode)>();
             foreach (var s in _series)
             {
                 try
@@ -543,24 +596,37 @@ namespace AP_Coursework_GUI
                     if (seriesData.Count == 0 && ErrorBox.Text.StartsWith("Setup error:")) break;
 
                     var pts = new List<Point>(targetSamples);
-                    double x = _viewXmin;
-                    for (int i = 0; i < targetSamples; i++)
+                    if (s.Mode == "vertical")
                     {
-                        string yStr = ExprEvaluator.EvaluateExprForX(s.Expr, x);
-                        if (double.TryParse(yStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double y)
-                            && !double.IsNaN(y) && !double.IsInfinity(y))
+                        string xValStr = ExprEvaluator.EvaluateExpression(s.Expr);
+                        if (double.TryParse(xValStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double xv))
                         {
-                            pts.Add(new Point(x, y));
+                            // Placeholders for vertical line
+                            pts.Add(new Point(xv, 0));
                         }
-                        x += step;
+                    }
+                    else
+                    {
+                        double x = _viewXmin;
+                        for (int i = 0; i < targetSamples; i++)
+                        {
+                            string yStr = ExprEvaluator.EvaluateExprForX(s.Expr, x);
+                            if (double.TryParse(yStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double y)
+                                && !double.IsNaN(y) && !double.IsInfinity(y))
+                            {
+                                pts.Add(new Point(x, y));
+                            }
+                            x += step;
+                        }
                     }
 
-                    if (pts.Count >= 2)
+                    if (pts.Count >= 1)
                     {
                         string label = s.Expr;
-                        var m = Regex.Match(s.Expr, "^\\s*([A-Za-z]\\w*)\\s*\\(\\s*x\\s*\\)\\s*$");
+                        var m = Regex.Match(s.Expr, @"^\s*([A-Za-z]\w*)\s*\(\s*x\s*\)\s*$");
                         if (m.Success) label = m.Groups[1].Value + "(x)";
-                        seriesData.Add((pts, s.Stroke, label));
+                        else if (s.Mode == "vertical") label = "x=" + s.Expr;
+                        seriesData.Add((pts, s.Stroke, label, s.Mode));
                     }
                 }
                 catch
@@ -762,7 +828,7 @@ namespace AP_Coursework_GUI
         }
 
         // New: Multi-series renderer
-        private void DrawPlotMulti(List<(List<Point> Data, Brush Stroke, string Label)> seriesData, double xmin, double xmax)
+        private void DrawPlotMulti(List<(List<Point> Data, Brush Stroke, string Label, string Mode)> seriesData, double xmin, double xmax)
         {
             if (PlotCanvas == null) return;
             PlotCanvas.Children.Clear();
@@ -792,6 +858,7 @@ namespace AP_Coursework_GUI
                 double yMaxData = double.NegativeInfinity;
                 foreach (var item in seriesData)
                 {
+                    if (item.Mode == "vertical") continue;
                     var Data = item.Data;
                     if (Data.Count == 0) continue;
                     double dmin = Data.Min(p => p.Y);
@@ -992,6 +1059,15 @@ namespace AP_Coursework_GUI
             {
                 var Data = item.Data;
                 var Stroke = item.Stroke;
+
+                if (item.Mode == "vertical" && Data.Count > 0)
+                {
+                    double xv = Data[0].X;
+                    double px = xToPx(xv);
+                    PlotCanvas.Children.Add(new Line { X1 = px, X2 = px, Y1 = pad, Y2 = height - pad, Stroke = Stroke, StrokeThickness = 2.5 });
+                    continue;
+                }
+
                 var sortedData = Data.OrderBy(p => p.X).ToList();
                 double yRangeForJump = Math.Max(1e-12, ymax - ymin);
                 double jumpThresh = yRangeForJump * 0.4;
