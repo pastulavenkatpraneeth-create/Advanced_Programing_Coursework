@@ -122,6 +122,7 @@ let mutable functionTable = Map.empty<string, string * Token list>
 // Plotting state for GUI integration
 let mutable plotPoints : (float * float) list = []
 let mutable plotMode : string option = None
+let mutable plotStep : float option = None
 let mutable plotRange : (float * float) option = None
 
 let mutable inExponentContext = false
@@ -445,13 +446,14 @@ and parseP tokens =
       let (t1, xVal, _) = parseE tail
       match t1 with
       | Comma :: t2 ->
-          let (t3, _dxVal, _) = parseE t2
+          let (t3, dxVal, _) = parseE t2
           match t3 with
           | Comma :: Ident mode :: Rpar :: rest ->
               // side-effect: compute y at current xVal and record point
               let yVal = evalYAt xVal
               plotPoints <- (xVal, yVal) :: plotPoints
               plotMode <- Some(mode.ToLowerInvariant())
+              plotStep <- Some dxVal
               rest, yVal, (not (isIntLike yVal))
           | _ -> raise (ParseError "Expected: plot(x, dx, mode)")
       | _ -> raise (ParseError "Expected comma in plot arguments")
@@ -840,14 +842,20 @@ let ResetState () =
     functionTable <- Map.empty
     plotPoints <- []
     plotMode <- None
+    plotStep <- None
     plotRange <- None
 
 let HasPlotData () = plotPoints <> []
 let GetPlotData () = plotPoints |> List.rev |> List.toArray
 let GetPlotMode () = match plotMode with | Some m -> m | None -> "linear"
+let GetPlotStep () = match plotStep with | Some s -> s | None -> 1.0
 let GetPlotRange () = match plotRange with | Some (a,b) -> (a,b) | None -> (0.0,1.0)
 let HasShadingRange () = match plotRange with | Some _ -> true | None -> false
-let ClearPlotData () = plotPoints <- []; plotMode <- None; plotRange <- None
+let ClearPlotData () = 
+    plotPoints <- []
+    plotMode <- None
+    plotStep <- None
+    plotRange <- None
 
 // -------- Transpiler to C# (INT5) --------
 

@@ -1,19 +1,12 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
+﻿using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
-using System.Windows.Navigation;
 using System.Windows.Shapes;
 
 
@@ -28,6 +21,8 @@ namespace AP_Coursework_GUI
             public string Expr { get; set; } = string.Empty;
             public string Mode { get; set; } = "linear";
             public Brush Stroke { get; set; } = Brushes.DarkBlue;
+            public List<Point>? Points { get; set; }
+            public double Step { get; set; } = 0.0;
         }
 
         private readonly List<Series> _series = new List<Series>();
@@ -175,11 +170,9 @@ namespace AP_Coursework_GUI
                                         };
                                         _series.Add(srs);
                                     }
-                                    // Initialize view from inputs
                                     if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _viewXmin)) _viewXmin = -10.0;
                                     if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _viewXmax)) _viewXmax = 10.0;
                                     if (_viewXmax <= _viewXmin) { _viewXmin = -10.0; _viewXmax = 10.0; }
-                                    double r = Math.Max(Math.Abs(_viewXmin), Math.Abs(_viewXmax)); if (r < 1e-9) r = 10.0; _viewXmin = -r; _viewXmax = r;
                                     _hasLive = true; _viewYmin = double.NaN; _viewYmax = double.NaN;
                                 }
                             }
@@ -202,25 +195,90 @@ namespace AP_Coursework_GUI
             ErrorBox.Clear();
             ResultTextBox.Clear();
 
-            // Normal sampled plotting using one or more series over [Xmin, Xmax] with Step.
-            if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmin) ||
-                !double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmax) ||
-                !double.TryParse(StepBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double step))
-            {
-                ErrorBox.Text = "Invalid range values. Use numbers for Xmin, Xmax, and Step.";
-                return;
-            }
-            if (step <= 0 || xmax <= xmin)
-            {
-                ErrorBox.Text = "Ensure: Step > 0 and Xmax > Xmin.";
-                return;
-            }
-
             string input = InputTextBox.Text.Trim();
             input = PreprocessYAssignment(input);
             if (string.IsNullOrWhiteSpace(input))
             {
                 ErrorBox.Text = "Enter definitions and expressions to plot.";
+                return;
+            }
+
+            // Check for scripted plot data (e.g. plot(x, dx, linear))
+            bool hadScripted = false;
+            try
+            {
+                ExprEvaluator.ResetState();
+                ExprEvaluator.EvaluateExpression(input);
+                if (ExprEvaluator.HasPlotData())
+                {
+                    var data = ExprEvaluator.GetPlotData();
+                    var mode = ExprEvaluator.GetPlotMode();
+                    var stepVal = ExprEvaluator.GetPlotStep();
+                    if (data != null && data.Length > 0)
+                    {
+                        var pts = data.Select(d => new Point(d.Item1, d.Item2)).ToList();
+                        string label = (mode == "linear") ? "Linear Interpolation" : "Discrete Plot";
+                        var ns = new Series
+                        {
+                            Setup = Array.Empty<string>(),
+                            Expr = label,
+                            Mode = mode,
+                            Points = pts,
+                            Step = stepVal,
+                            Stroke = _palette[_series.Count % _palette.Length]
+                        };
+
+                        var existing = _series.FirstOrDefault(s => string.Equals(s.Expr, ns.Expr, StringComparison.OrdinalIgnoreCase));
+                        if (existing != null)
+                        {
+                            existing.Points = ns.Points;
+                            existing.Step = ns.Step;
+                            existing.Mode = ns.Mode;
+                        }
+                        else
+                        {
+                            _series.Add(ns);
+                        }
+                        hadScripted = true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // If script evaluation fails here, we might still want to try normal plotting
+                // or report the error. Let's just log it to ErrorBox if it seems important.
+                if (input.Contains("plot(")) 
+                {
+                    ErrorBox.Text = "Script error: " + ex.Message;
+                    return; 
+                }
+            }
+
+            // Normal sampled plotting using one or more series over [Xmin, Xmax] with Step.
+            double xmin = -10, xmax = 10, step = 0.5;
+            bool rangeOk = double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out xmin) &&
+                           double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out xmax) &&
+                           double.TryParse(StepBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out step);
+
+            if (!rangeOk && !hadScripted)
+            {
+                ErrorBox.Text = "Invalid range values. Use numbers for Xmin, Xmax, and Step.";
+                return;
+            }
+
+            if (!hadScripted && (step <= 0 || xmax <= xmin))
+            {
+                ErrorBox.Text = "Ensure: Step > 0 and Xmax > Xmin.";
+                return;
+            }
+
+            // If we have scripted data, we might want to skip auto-adding function series to match the expected discrete-only view.
+            if (hadScripted)
+            {
+                _hasLive = true;
+                if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _viewXmin)) _viewXmin = -10.0;
+                if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _viewXmax)) _viewXmax = 10.0;
+                ReplotCurrentView();
                 return;
             }
 
@@ -319,10 +377,8 @@ namespace AP_Coursework_GUI
                 }
             }
             
-            double r = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-            if (r < 1e-9) r = 10.0;
-            _viewXmin = -r;
-            _viewXmax = r;
+            _viewXmin = xmin;
+            _viewXmax = xmax;
             _hasLive = true;
             _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
             _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
@@ -334,41 +390,108 @@ namespace AP_Coursework_GUI
         private void HelpMenu_Click(object sender, RoutedEventArgs e)
         {
             string helpText =
-                    "Valid tokens and syntax:\n" +
-                    "  Integers (e.g., 10)\n" +
-                    "  Floats (e.g., 23.45, 1e3, 2.5E-4)\n" +
-                    "  Identifiers (variables/functions): start with a letter, then letters/digits/_\n" +
-                    "  Operators: +  -  *  /  %  ^  (power is LEFT-associative)\n" +
-                    "  Parentheses: ( )\n\n" +
-                    "Statements (separate by newline or ';'):\n" +
-                    "  Assignment:    x = 10;   a = 2.5;\n" +
-                    "  Function def:  f(x) = x^2 + 2*x + 1\n" +
-                    "  For plotting/analysis: define y(x) = ... (used by plot/diff/integrate/root/tangent).\n" +
-                    "  For transpiling: y(x) is optional; if omitted, the first defined function becomes the entry point.\n\n" +
-                    "Built-ins (to enter in the expression box):\n" +
-                    "  plot(x, dx, mode)        // buffers point (x, y(x)) with mode = linear|spline\n" +
-                    "  diff(x0[, h])            // numeric derivative of y at x0\n" +
-                    "  sdiff(x0)                // symbolic derivative via LUT where possible, else numeric\n" +
-                    "  tangent(x0, halfW[, m])  // buffers a short tangent segment around x0\n" +
-                    "  integrate(a, b[, n])     // trapezoid rule on y over [a,b]; also shades [a,b]\n" +
-                    "  root_bisect(a,b[,tol][,maxIter])\n" +
-                    "  root_newton(x0[,tol][,maxIter])\n" +
-                    "  root_secant(x0,x1[,tol][,maxIter])\n" +
-                    "  shade(a,b)               // mark [a,b] for area shading (signed)\n\n" +
-                    "Vector/Matrix helpers (scalar results):\n" +
-                    "  dot(a1,b1[,a2,b2,...])   // dot product of two equal-length vectors\n" +
-                    "  norm(a1[,a2,...])        // Euclidean norm sqrt(sum(ai^2))\n" +
-                    "  det(a,b,c,d)             // 2x2 determinant |a b; c d|\n" +
-                    "  det(a11,..,a33)          // 3x3 determinant (row-major)\n\n" +
-                    "Operator precedence (BODMAS/BIDMAS):\n" +
-                    "  Highest: unary +/- ; then ^ (left-assoc) ; then * / % ; then + -\n\n" +
-                    "Notes:\n" +
-                    "  - Division by zero is detected.\n" +
-                    "  - Using variables before assignment is an error.\n" +
-                    "  - Fractional powers are supported (a^b) with real-domain checks (no negative base to fractional).\n" +
-                    "  - Enter multiple lines: definitions first, then y(x), then analysis call (e.g., integrate(...)).\n";
+                                "=== QUICK START GUIDE ===\n\n" +
+                                "1. BASIC MATH & NUMBERS\n" +
+                                "   You can use this tool like a standard calculator.\n" +
+                                "   • Numbers: Integers (10), Decimals (23.45), or Scientific (1e3, 2.5E-2).\n" +
+                                "   • Operators: + (Add), - (Subtract), * (Multiply), / (Divide), % (Remainder), ^ (Power).\n" +
+                                "   • Order of Operations: Standard BODMAS/BIDMAS rules apply.\n" +
+                                "     (Note: Powers are processed left-to-right).\n\n" +
+                                "2. VARIABLES & FUNCTIONS\n" +
+                                "   • Save a number:        x = 10;    width = 5.5\n" +
+                                "   • Define a function:    f(x) = x^2 + 2*x + 1\n" +
+                                "   • REQUIRED for plotting/calculus: define y(x)\n" +
+                                "       Example: y(x) = sin(x)\n\n" +
+                                "3. BUILT-IN MATH FUNCTIONS (syntax and examples)\n" +
+                                "   • sin(u)      → sine.            Example: sin(3.14159/2)\n" +
+                                "   • cos(u)      → cosine.          Example: cos(0)\n" +
+                                "   • tan(u)      → tangent.         Example: tan(0.5)\n" +
+                                "   • exp(u)      → e^u.             Example: exp(1)  // ≈ 2.71828\n" +
+                                "   • log(u)      → natural log.     Example: log(2)  // u must be > 0\n" +
+                                "   • sqrt(u)     → square root.     Example: sqrt(9) // u ≥ 0\n" +
+                                "   • abs(u)      → absolute value.  Example: abs(-3.2)\n\n" +
+                                "4. PLOTTING & VISUALS (require y(x))\n" +
+                                "   • plot(x, step, mode)\n" +
+                                "       - Calculates y(x) and buffers a point.\n" +
+                                "       - mode: linear | spline (spline uses Catmull-Rom when safe).\n" +
+                                "       Example: y(x) = x^3 - 4*x;\n" +
+                                "                for x = -3 to 3 step 1 do plot(x, 1, linear)\n" +
+                                "       Example: y(x) = sin(x);\n" +
+                                "                for x = -6.28 to 6.28 step 0.2 do plot(x, 0.2, spline)\n" +
+                                "   • shade(a, b)\n" +
+                                "       - Highlight area under y(x) from a to b. Returns (b-a).\n" +
+                                "       Example: y(x) = x^2; shade(-1, 2)\n" +
+                                "   • tangent(x0, halfWidth[, mode])\n" +
+                                "       - Draw a straight-line tangent near x0 over given half-width.\n" +
+                                "       - Optional mode: linear | spline (for the tangent segment styling).\n" +
+                                "       Example: y(x) = x^3 - x; tangent(1, 0.5, spline)\n\n" +
+                                "5. CALCULUS & ROOTS (operate on current y(x))\n" +
+                                "   • diff(x0[, h])\n" +
+                                "       - Derivative at x0. Uses symbolic diff when possible, else numeric.\n" +
+                                "       - h default = 1e-5.\n" +
+                                "       Example: y(x) = x^2; diff(3)    // ≈ 6\n" +
+                                "   • sdiff(x0[, h])\n" +
+                                "       - Alias of diff(x0[, h]); kept for backward compatibility.\n" +
+                                "       Example: y(x) = x^2; sdiff(3)   // ≈ 6\n" +
+                                "   • integrate(a, b[, n])\n" +
+                                "       - Trapezoidal rule with n slices (default n = 100).\n" +
+                                "       Example: y(x) = x; integrate(0, 1)   // ≈ 0.5\n" +
+                                "   • root_bisect(a, b[, tol][, maxIter])\n" +
+                                "       - Find x where y(x)=0 between a and b.\n" +
+                                "       - tol default ≈ 1e-10; maxIter default ~ 100.\n" +
+                                "       Example: y(x) = x^3 - 2*x - 5; root_bisect(2, 3)\n" +
+                                "   • root_newton(x0[, tol][, maxIter])\n" +
+                                "       - Newton's method starting at x0.\n" +
+                                "       Example: y(x) = cos(x) - x; root_newton(0.5)\n" +
+                                "   • root_secant(x0, x1[, tol][, maxIter])\n" +
+                                "       - Secant method between x0 and x1.\n" +
+                                "       Example: y(x) = x^2 - 2; root_secant(1, 2)\n\n" +
+                                "6. CONTROL FLOW\n" +
+                                "   • for loop:  for x = a to b [step s] do <expression>\n" +
+                                "       - Example (plot): y(x) = x^2; for x = -3 to 3 step 0.5 do plot(x, 0.5, linear)\n\n" +
+                                "7. VECTORS & MATRICES (scalar results)\n" +
+                                "   • dot(a1,b1[, a2,b2, ...])\n" +
+                                "       - Dot product of two equal-length vectors given as pairs.\n" +
+                                "       Example: dot(1,2, 3,4)   // 1*3 + 2*4 = 11\n" +
+                                "   • norm(a1[, a2, ...])\n" +
+                                "       - Euclidean length.\n" +
+                                "       Example: norm(3, 4)      // 5\n" +
+                                "   • det(a,b,c,d)\n" +
+                                "       - Determinant of 2x2 |a b; c d|.\n" +
+                                "       Example: det(1,2, 3,4)  // -2\n" +
+                                "   • det(a11,a12,a13,a21,a22,a23,a31,a32,a33)\n" +
+                                "       - Determinant of 3x3 (row-major).\n" +
+                                "       Example: det(1,0,0, 0,1,0, 0,0,1) // 1\n\n" +
+                                "=== USEFUL TIPS ===\n" +
+                                "   • Separate multiple commands with a semicolon (;) or a new line.\n" +
+                                "   • You can't use a variable (like 'a') before you assign it a value.\n" +
+                                "   • Division by zero or invalid domains (e.g., log(x<=0), sqrt(x<0)) cause errors.\n" +
+                                "   • For Transpiling: If you don't define y(x), the first function you wrote may be used.\n";
 
-            MessageBox.Show(helpText, "Help - Syntax and Tokens", MessageBoxButton.OK, MessageBoxImage.Information);
+            var tb = new TextBlock
+            {
+                Text = helpText,
+                TextWrapping = TextWrapping.Wrap,
+                FontFamily = new FontFamily("Consolas"),
+                FontSize = 13,
+                Margin = new Thickness(16)
+            };
+            var scroller = new ScrollViewer
+            {
+                Content = tb,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            var dlg = new Window
+            {
+                Title = "Help - Quick Start",
+                Owner = this,
+                Width = 1000,
+                Height = 700,
+                Content = scroller,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+            dlg.ShowDialog();
         }
 
         // -------- Transpiler/Compiler (GUI4) helpers --------
@@ -419,7 +542,7 @@ namespace AP_Coursework_GUI
                         return;
                     }
                 }
-                ErrorBox.Text = "Interpreter source looks valid.";
+                ResultTextBox.Text = "Interpreter source looks valid.";
             }
             catch (Exception ex)
             {
@@ -484,7 +607,7 @@ namespace AP_Coursework_GUI
                 var (codeExit, so, se) = RunProcess("dotnet", "build -c Release", dir);
                 if (codeExit == 0)
                 {
-                    ErrorBox.Text = "C# validation succeeded.";
+                    ResultTextBox.Text = "C# validation succeeded.";
                 }
                 else
                 {
@@ -511,7 +634,7 @@ namespace AP_Coursework_GUI
                 {
                     _lastBuildDir = dir;
                     _lastExePath = exe;
-                    ErrorBox.Text = "Build succeeded.";
+                    ResultTextBox.Text = "Build succeeded.";
                 }
                 else
                 {
@@ -566,18 +689,13 @@ namespace AP_Coursework_GUI
         {
             if (PlotCanvas == null || !_hasLive) return;
             
-            double r = Math.Max(Math.Abs(_viewXmin), Math.Abs(_viewXmax));
-            if (r < 1e-9) r = 10.0;
-            _viewXmin = -r;
-            _viewXmax = r;
-
             double width = Math.Max(PlotCanvas.ActualWidth, 10);
             int targetSamples = (int)Math.Clamp(Math.Round(width / 2.5), 200, 2000);
             double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
             double step = xrange / Math.Max(1, (targetSamples - 1));
 
             // Sample each series independently with its setup
-            var seriesData = new List<(List<Point> Data, Brush Stroke, string Label, string Mode)>();
+            var seriesData = new List<(List<Point> Data, Brush Stroke, string Label, string Mode, bool IsDiscrete)>();
             foreach (var s in _series)
             {
                 try
@@ -595,8 +713,12 @@ namespace AP_Coursework_GUI
                     }
                     if (seriesData.Count == 0 && ErrorBox.Text.StartsWith("Setup error:")) break;
 
-                    var pts = new List<Point>(targetSamples);
-                    if (s.Mode == "vertical")
+                    var pts = new List<Point>();
+                    if (s.Points != null)
+                    {
+                        pts.AddRange(s.Points);
+                    }
+                    else if (s.Mode == "vertical")
                     {
                         string xValStr = ExprEvaluator.EvaluateExpression(s.Expr);
                         if (double.TryParse(xValStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double xv))
@@ -623,10 +745,17 @@ namespace AP_Coursework_GUI
                     if (pts.Count >= 1)
                     {
                         string label = s.Expr;
-                        var m = Regex.Match(s.Expr, @"^\s*([A-Za-z]\w*)\s*\(\s*x\s*\)\s*$");
-                        if (m.Success) label = m.Groups[1].Value + "(x)";
-                        else if (s.Mode == "vertical") label = "x=" + s.Expr;
-                        seriesData.Add((pts, s.Stroke, label, s.Mode));
+                        if (s.Points != null && s.Mode == "linear")
+                        {
+                            label = $"Linear Interpolation (Step={s.Step.ToString("0.###", CultureInfo.InvariantCulture)})";
+                        }
+                        else
+                        {
+                            var m = Regex.Match(s.Expr, @"^\s*([A-Za-z]\w*)\s*\(\s*x\s*\)\s*$");
+                            if (m.Success) label = m.Groups[1].Value + "(x)";
+                            else if (s.Mode == "vertical") label = "x=" + s.Expr;
+                        }
+                        seriesData.Add((pts, s.Stroke, label, s.Mode, s.Points != null));
                     }
                 }
                 catch
@@ -703,62 +832,32 @@ namespace AP_Coursework_GUI
         // Mouse interaction handlers for panning and zooming on PlotCanvas
         private void PlotCanvas_MouseWheel(object sender, MouseWheelEventArgs e)
         {
-            if (PlotCanvas == null) return;
+            if (PlotCanvas == null || !_livePlotEnabled || !_hasLive) return;
 
-            // Live mode: zoom symmetrically around 0 so origin stays centered, for BOTH axes
-            if (_livePlotEnabled && _hasLive)
+            double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
+
+            // Zoom X
+            double xCenter = (_viewXmin + _viewXmax) / 2.0;
+            double xHalfRange = (_viewXmax - _viewXmin) / 2.0 / zoom;
+            _viewXmin = xCenter - xHalfRange;
+            _viewXmax = xCenter + xHalfRange;
+
+            // Zoom Y
+            if (!double.IsNaN(_viewYmin) && !double.IsNaN(_viewYmax))
             {
-                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1; // wheel up -> zoom in
-
-                // X axis
-                double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
-                double newXRange = xrange / zoom;
-                double rx = Math.Max(newXRange / 2.0, 1e-6);
-                _viewXmin = -rx;
-                _viewXmax = rx;
-
-                // Y axis
-                if (!double.IsNaN(_viewYmin) && !double.IsNaN(_viewYmax) && _viewYmax > _viewYmin)
-                {
-                    double yrange = Math.Max(1e-9, _viewYmax - _viewYmin);
-                    double newYRange = yrange / zoom;
-                    double ry = Math.Max(newYRange / 2.0, 1e-6);
-                    _viewYmin = -ry;
-                    _viewYmax = ry;
-                }
-
-                // Reset transform to avoid double transforms
-                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-
-                ReplotCurrentView();
-                e.Handled = true;
-                return;
+                double yCenter = (_viewYmin + _viewYmax) / 2.0;
+                double yHalfRange = (_viewYmax - _viewYmin) / 2.0 / zoom;
+                _viewYmin = yCenter - yHalfRange;
+                _viewYmax = yCenter + yHalfRange;
             }
 
-            if (_hasLive)
-            {
-                double xrange = Math.Max(1e-9, _viewXmax - _viewXmin);
-                double zoom = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
-                double newRange = xrange / zoom;
-                double r = Math.Max(newRange / 2.0, 1e-6);
-                _viewXmin = -r;
-                _viewXmax = r;
-                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-                ReplotCurrentView();
-                e.Handled = true;
-                return;
-            }
-
-            _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-            _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
+            ReplotCurrentView();
             e.Handled = true;
         }
 
         private void PlotCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (PlotCanvas == null) return;
+            if (PlotCanvas == null || !_livePlotEnabled || !_hasLive) return;
             _isPanning = true;
             _lastPanPoint = e.GetPosition(PlotCanvas);
             PlotCanvas.CaptureMouse();
@@ -775,50 +874,49 @@ namespace AP_Coursework_GUI
 
         private void PlotCanvas_MouseMove(object sender, MouseEventArgs e)
         {
-            if (!_isPanning || PlotCanvas == null) return;
+            if (!_isPanning || PlotCanvas == null || !_livePlotEnabled || !_hasLive) return;
             Point p = e.GetPosition(PlotCanvas);
-            Vector delta = p - _lastPanPoint;
+            Vector deltaPx = p - _lastPanPoint;
             _lastPanPoint = p;
 
-            if (_livePlotEnabled && _hasLive)
-            {
-                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-                ReplotCurrentView();
-            }
-            else
-            {
-                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-                if (_hasLive) ReplotCurrentView();
-            }
+            double width = PlotCanvas.ActualWidth;
+            double height = PlotCanvas.ActualHeight;
+            if (width < 10 || height < 10) return;
+
+            double xRange = _viewXmax - _viewXmin;
+            double yRange = _viewYmax - _viewYmin;
+
+            double effectiveWidth = width - 2 * PlotPad;
+            double effectiveHeight = height - 2 * PlotPad;
+            if (effectiveWidth < 1 || effectiveHeight < 1) return;
+
+            double dx = deltaPx.X * xRange / effectiveWidth;
+            double dy = deltaPx.Y * yRange / effectiveHeight;
+
+            _viewXmin -= dx;
+            _viewXmax -= dx;
+            _viewYmin += dy; 
+            _viewYmax += dy;
+
+            ReplotCurrentView();
             e.Handled = true;
         }
 
         private void PlotCanvas_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (_livePlotEnabled && _hasLive)
-            {
-                // Reset world range to inputs or defaults
-                if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmin)) xmin = -10.0;
-                if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmax)) xmax = 10.0;
-                if (xmax <= xmin) { xmin = -10.0; xmax = 10.0; }
-                double r = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-                if (r < 1e-9) r = 10.0;
-                _viewXmin = -r;
-                _viewXmax = r;
-                _scaleTransform.ScaleX = 1.0; _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0; _translateTransform.Y = 0.0;
-                ReplotCurrentView();
-            }
-            else
-            {
-                // Reset transform view
-                _scaleTransform.ScaleX = 1.0;
-                _scaleTransform.ScaleY = 1.0;
-                _translateTransform.X = 0.0;
-                _translateTransform.Y = 0.0;
-            }
+            if (!_livePlotEnabled || !_hasLive) return;
+
+            // Reset world range to inputs or defaults
+            if (!double.TryParse(XMinBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmin)) xmin = -10.0;
+            if (!double.TryParse(XMaxBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double xmax)) xmax = 10.0;
+            if (xmax <= xmin) { xmin = -10.0; xmax = 10.0; }
+
+            _viewXmin = xmin;
+            _viewXmax = xmax;
+            _viewYmin = double.NaN;
+            _viewYmax = double.NaN;
+
+            ReplotCurrentView();
             e.Handled = true;
         }
         
@@ -827,8 +925,8 @@ namespace AP_Coursework_GUI
             DrawPlot(data, xmin, xmax, "linear");
         }
 
-        // New: Multi-series renderer
-        private void DrawPlotMulti(List<(List<Point> Data, Brush Stroke, string Label, string Mode)> seriesData, double xmin, double xmax)
+        // Multi-series renderer
+        private void DrawPlotMulti(List<(List<Point> Data, Brush Stroke, string Label, string Mode, bool IsDiscrete)> seriesData, double xmin, double xmax)
         {
             if (PlotCanvas == null) return;
             PlotCanvas.Children.Clear();
@@ -840,13 +938,11 @@ namespace AP_Coursework_GUI
             if (height < 50) height = 500;
             double pad = PlotPad;
 
-            // Symmetric X range around 0 so (0,0) is at canvas center
-            double xAbsMax = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-            if (xAbsMax < 1e-9) xAbsMax = 10.0;
-            double sxmin = -xAbsMax;
-            double sxmax = xAbsMax;
+            // Use provided X range (no forced symmetry)
+            double sxmin = xmin;
+            double sxmax = xmax;
 
-            // Determine combined Y range across all series, then symmetrize about 0
+            // Determine combined Y range across all series
             double ymin, ymax;
             if (_livePlotEnabled && _hasLive && !double.IsNaN(_viewYmin) && !double.IsNaN(_viewYmax) && _viewYmax > _viewYmin)
             {
@@ -881,9 +977,7 @@ namespace AP_Coursework_GUI
                     ymax = yMaxData + padY;
                 }
             }
-            double rY = Math.Max(Math.Abs(ymin), Math.Abs(ymax));
-            if (rY < 1e-9) rY = 1.0;
-            ymin = -rY; ymax = rY;
+            
             if (_livePlotEnabled && _hasLive)
             {
                 _viewYmin = ymin; _viewYmax = ymax;
@@ -1070,7 +1164,7 @@ namespace AP_Coursework_GUI
 
                 var sortedData = Data.OrderBy(p => p.X).ToList();
                 double yRangeForJump = Math.Max(1e-12, ymax - ymin);
-                double jumpThresh = yRangeForJump * 0.4;
+                double jumpThresh = item.IsDiscrete ? (yRangeForJump * 1.1) : (yRangeForJump * 0.85);
                 void AddSegment(List<Point> seg)
                 {
                     if (seg.Count < 2) return;
@@ -1089,6 +1183,36 @@ namespace AP_Coursework_GUI
                     else segBuf.Add(p);
                 }
                 AddSegment(segBuf);
+
+                // Markers and Labels for discrete plots
+                if (sortedData.Count > 0 && sortedData.Count <= 30)
+                {
+                    foreach (var p in sortedData)
+                    {
+                        double px = xToPx(p.X);
+                        double py = yToPy(p.Y);
+
+                        var dot = new Ellipse
+                        {
+                            Width = 6,
+                            Height = 6,
+                            Fill = Stroke,
+                            Margin = new Thickness(px - 3, py - 3, 0, 0)
+                        };
+                        PlotCanvas.Children.Add(dot);
+
+                        var lbl = new TextBlock
+                        {
+                            Text = $"({NumLabel(p.X)}, {NumLabel(p.Y)})",
+                            FontSize = 10,
+                            Foreground = Brushes.Black,
+                            Background = new SolidColorBrush(Color.FromArgb(160, 255, 255, 255))
+                        };
+                        PlotCanvas.Children.Add(lbl);
+                        Canvas.SetLeft(lbl, px + 5);
+                        Canvas.SetTop(lbl, py - 15);
+                    }
+                }
             }
             
             if (_overlays.Count > 0)
@@ -1148,10 +1272,8 @@ namespace AP_Coursework_GUI
             if (height < 50) height = 500;
             double pad = PlotPad;
             
-            double xAbsMax = Math.Max(Math.Abs(xmin), Math.Abs(xmax));
-            if (xAbsMax < 1e-9) xAbsMax = 10.0;
-            double sxmin = -xAbsMax;
-            double sxmax = xAbsMax;
+            double sxmin = xmin;
+            double sxmax = xmax;
             
             double ymin, ymax;
             if (_livePlotEnabled && _hasLive && !double.IsNaN(_viewYmin) && !double.IsNaN(_viewYmax) && _viewYmax > _viewYmin)
@@ -1178,9 +1300,6 @@ namespace AP_Coursework_GUI
                 }
             }
             
-            double rY = Math.Max(Math.Abs(ymin), Math.Abs(ymax));
-            if (rY < 1e-9) rY = 1.0;
-            ymin = -rY; ymax = rY;
             if (_livePlotEnabled && _hasLive)
             {
                 _viewYmin = ymin;
@@ -1418,7 +1537,7 @@ namespace AP_Coursework_GUI
             
             var sortedData = data.OrderBy(p => p.X).ToList();
             double yRangeForJump = Math.Max(1e-12, ymax - ymin);
-            double jumpThresh = yRangeForJump * 0.4;
+            double jumpThresh = yRangeForJump * 0.85;
             bool wantSpline = string.Equals(mode, "spline", StringComparison.OrdinalIgnoreCase) && sortedData.Count >= 4;
             
             void AddSegment(List<Point> seg)
