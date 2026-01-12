@@ -61,7 +61,7 @@
                 <DropShadowEffect Color="#33000000" BlurRadius="10" ShadowDepth="2"/>
             </Border.Effect>
             
-            <Expander IsExpanded="True">
+            <Expander IsExpanded="False">
                 <Expander.Header>
                     <DockPanel LastChildFill="True">
                         <TextBlock Text="Transpiler (Interpreter → C#)"
